@@ -994,20 +994,26 @@ export class StateStore {
         )
         .all(safeLimit) as WhaleSignal[];
 
+      const claimedSignals: WhaleSignal[] = [];
       for (const signal of signals) {
-        this.runPreparedStatement(
-          this.alphaDb,
-          "UPDATE whale_signals SET status = 'processing', processed_at = ? WHERE id = ? AND status = 'pending'",
-          now,
-          signal.id,
-        );
+        const result = this.alphaDb
+          .prepare(
+            "UPDATE whale_signals SET status = 'processing', processed_at = ? WHERE id = ? AND status = 'pending'",
+          )
+          .run(now, signal.id);
+
+        if (result.changes !== 1) {
+          continue;
+        }
+
+        claimedSignals.push({
+          ...signal,
+          status: "processing" as const,
+          processedAt: now,
+        });
       }
 
-      return signals.map((signal) => ({
-        ...signal,
-        status: "processing" as const,
-        processedAt: now,
-      }));
+      return claimedSignals;
     });
     return transaction();
   }

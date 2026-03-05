@@ -102,9 +102,34 @@ export class DexArbitragePlugin implements StrategyPlugin {
   }
 
   async evaluate(input: Opportunity, ctx: EvalContext): Promise<EvalResult> {
+    if (
+      !Number.isFinite(input.buyPrice) ||
+      !Number.isFinite(input.sellPrice) ||
+      input.buyPrice <= 0 ||
+      input.sellPrice <= 0
+    ) {
+      return {
+        accepted: false,
+        reason: "invalid opportunity price: buy/sell must be > 0",
+        opportunity: input,
+      };
+    }
+
     const nowIso = ctx.nowIso ?? new Date().toISOString();
     const buyQuote = ctx.quotes?.find((quote) => quote.dex === input.buyDex && quote.pair === input.pair);
     const sellQuote = ctx.quotes?.find((quote) => quote.dex === input.sellDex && quote.pair === input.pair);
+    if (
+      (buyQuote && (!Number.isFinite(buyQuote.ask) || !Number.isFinite(buyQuote.bid) || buyQuote.ask <= 0 || buyQuote.bid <= 0)) ||
+      (sellQuote &&
+        (!Number.isFinite(sellQuote.ask) || !Number.isFinite(sellQuote.bid) || sellQuote.ask <= 0 || sellQuote.bid <= 0))
+    ) {
+      return {
+        accepted: false,
+        reason: "invalid quote price: bid/ask must be > 0",
+        opportunity: input,
+      };
+    }
+
     const observedLatencies = [buyQuote, sellQuote]
       .map((quote) => (quote ? quoteLatencyMs(quote.ts, nowIso) : null))
       .filter((value): value is number => value !== null);
