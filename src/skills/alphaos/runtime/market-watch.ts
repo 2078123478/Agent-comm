@@ -261,13 +261,7 @@ export class WsMarketWatch {
     }
 
     const root = parsed as Record<string, unknown>;
-    const candidates = Array.isArray(root.quotes)
-      ? root.quotes
-      : root.quote
-        ? [root.quote]
-        : root.type === "quote"
-          ? [root]
-          : [];
+    const candidates = this.extractQuoteCandidates(root);
 
     for (const candidate of candidates) {
       const quote = parseQuote(candidate);
@@ -275,6 +269,19 @@ export class WsMarketWatch {
         this.options.onQuote(quote);
       }
     }
+  }
+
+  private extractQuoteCandidates(root: Record<string, unknown>): unknown[] {
+    if (Array.isArray(root.quotes)) {
+      return root.quotes;
+    }
+    if (root.quote) {
+      return [root.quote];
+    }
+    if (root.type === "quote") {
+      return [root];
+    }
+    return [];
   }
 }
 
@@ -344,21 +351,27 @@ export class MarketWatch {
     const medians = this.buildPairMedians(quotes);
     const accepted: Quote[] = [];
     for (const quote of quotes) {
-      if (!this.validateQuote(quote, source)) {
-        continue;
+      if (this.processSingleQuote(quote, source, medians)) {
+        accepted.push(quote);
       }
-
-      const anomaly = this.detectAnomaly(quote, medians.get(quote.pair) ?? null);
-      if (anomaly) {
-        this.markAnomaly(anomaly);
-        continue;
-      }
-
-      this.anomalyStreak = 0;
-      this.acceptQuote(quote);
-      accepted.push(quote);
     }
     return accepted;
+  }
+
+  private processSingleQuote(quote: Quote, source: "poll" | "ws", medians: Map<string, number | null>): boolean {
+    if (!this.validateQuote(quote, source)) {
+      return false;
+    }
+
+    const anomaly = this.detectAnomaly(quote, medians.get(quote.pair) ?? null);
+    if (anomaly) {
+      this.markAnomaly(anomaly);
+      return false;
+    }
+
+    this.anomalyStreak = 0;
+    this.acceptQuote(quote);
+    return true;
   }
 
   private detectAnomaly(quote: Quote, pairMedian: number | null): string | null {
