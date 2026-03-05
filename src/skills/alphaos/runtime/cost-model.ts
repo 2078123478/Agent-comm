@@ -33,6 +33,13 @@ export interface NetOutcome {
   netEdgeBps: number;
 }
 
+export interface TailRiskContext {
+  volatility?: number;
+  avgLatencyMs?: number;
+  liquidityUsd?: number;
+  slippageBps?: number;
+}
+
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
@@ -142,10 +149,32 @@ export function estimateExpectedShortfall(
   pFail: number,
   totalCostUsd: number,
   netEdgeBps: number,
+  context: TailRiskContext = {},
 ): number {
   const safeNotional = Math.max(0, notionalUsd);
   const safePFail = clamp(pFail, 0, 1);
-  const tailMoveBps = Math.max(12, Math.abs(Math.min(netEdgeBps, 0)) * 0.8 + 12);
+  const safeVolatility = clamp(Math.max(0, context.volatility ?? 0), 0, 1);
+  const safeLatencyMs = Math.max(0, context.avgLatencyMs ?? 0);
+  const safeLiquidityUsd = Math.max(1000, context.liquidityUsd ?? safeNotional * 10);
+  const safeSlippageBps = Math.max(0, context.slippageBps ?? 12);
+
+  const downsideBps = Math.max(0, -netEdgeBps);
+  const volatilityTailBps = 10 + safeVolatility * 120;
+  const latencyTailBps = Math.min(20, (safeLatencyMs / 3000) * 20);
+  const liquidityTailBps = Math.min(25, (safeNotional / safeLiquidityUsd) * 80);
+  const slippageTailBps = Math.min(20, safeSlippageBps * 0.4);
+  const positiveEdgeReliefBps = netEdgeBps > 0 ? Math.min(8, netEdgeBps * 0.06) : 0;
+
+  const tailMoveBps = Math.max(
+    12,
+    6 +
+      downsideBps * 0.8 +
+      volatilityTailBps +
+      latencyTailBps +
+      liquidityTailBps +
+      slippageTailBps -
+      positiveEdgeReliefBps,
+  );
   const tailMoveUsd = safeNotional * tailMoveBps / 10_000;
   return safePFail * (Math.max(0, totalCostUsd) + tailMoveUsd);
 }

@@ -78,6 +78,12 @@ export class Simulator {
       pFail,
       feeUsd,
       netEdgeBps,
+      {
+        volatility,
+        avgLatencyMs,
+        liquidityUsd,
+        slippageBps: this.options.slippageBps,
+      },
     );
     const latencyAdjustedNetUsd = netUsd - expectedShortfall;
     const riskAdjustedNetEdgeBps = plan.notionalUsd > 0 ? (latencyAdjustedNetUsd / plan.notionalUsd) * 10_000 : -Infinity;
