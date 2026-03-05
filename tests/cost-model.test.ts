@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  calculateGrossEdgeBps,
   estimateExpectedShortfall,
   estimateLatencyPenalty,
   estimateSlippage,
@@ -34,5 +35,24 @@ describe("cost-model helpers", () => {
     });
 
     expect(highVol).toBeGreaterThan(lowVol);
+  });
+
+  it("calculates gross edge bps for normal prices", () => {
+    expect(calculateGrossEdgeBps(100, 101)).toBe(100);
+  });
+
+  it("returns zero gross edge when prices are equal", () => {
+    expect(calculateGrossEdgeBps(100, 100)).toBe(0);
+  });
+
+  it("returns null for invalid prices", () => {
+    expect(calculateGrossEdgeBps(0, 101)).toBeNull();
+    expect(calculateGrossEdgeBps(-1, 101)).toBeNull();
+    expect(calculateGrossEdgeBps(100, 0)).toBeNull();
+    expect(calculateGrossEdgeBps(100, -1)).toBeNull();
+  });
+
+  it("keeps decimal precision for fractional prices", () => {
+    expect(calculateGrossEdgeBps(99.8, 101)).toBeCloseTo(120.2404809619, 10);
   });
 });

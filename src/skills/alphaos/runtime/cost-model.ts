@@ -44,6 +44,26 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
+/**
+ * 计算套利交易的毛边际（单位：bps）
+ * 公式：((sell.bid - buy.ask) / buy.ask) * 10_000
+ *
+ * @param buyAsk - 买入DEX的卖价
+ * @param sellBid - 卖出DEX的买价
+ * @returns 毛边际（bps），如果价格无效返回 null
+ */
+export function calculateGrossEdgeBps(buyAsk: number, sellBid: number): number | null {
+  if (
+    !Number.isFinite(buyAsk) ||
+    !Number.isFinite(sellBid) ||
+    buyAsk <= 0 ||
+    sellBid <= 0
+  ) {
+    return null;
+  }
+  return ((sellBid - buyAsk) / buyAsk) * 10_000;
+}
+
 export function estimateSlippage(
   notionalUsd: number,
   liquidityUsd: number,

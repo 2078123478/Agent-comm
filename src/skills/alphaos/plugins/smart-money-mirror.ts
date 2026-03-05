@@ -11,6 +11,7 @@ import type {
   WhaleSignal,
 } from "../types";
 import { StateStore } from "../runtime/state-store";
+import { calculateGrossEdgeBps } from "../runtime/cost-model";
 
 function toPair(token: string): string {
   const normalized = token.toUpperCase().replace(/[^A-Z0-9]/g, "");
@@ -32,7 +33,10 @@ function findExecutableQuotes(
       if (buy.dex === sell.dex || buy.ask <= 0) {
         continue;
       }
-      const grossEdgeBps = ((sell.bid - buy.ask) / buy.ask) * 10_000;
+      const grossEdgeBps = calculateGrossEdgeBps(buy.ask, sell.bid);
+      if (grossEdgeBps === null) {
+        continue;
+      }
       if (!best || grossEdgeBps > best.grossEdgeBps) {
         best = { buy, sell, grossEdgeBps };
       }

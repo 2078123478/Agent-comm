@@ -9,7 +9,11 @@ import type {
   ScanContext,
   StrategyPlugin,
 } from "../types";
-import { calculateCostBreakdown, calculateNetOutcome } from "../runtime/cost-model";
+import {
+  calculateCostBreakdown,
+  calculateGrossEdgeBps,
+  calculateNetOutcome,
+} from "../runtime/cost-model";
 
 interface DexArbitrageOptions {
   takerFeeBps: number;
@@ -83,7 +87,10 @@ export class DexArbitragePlugin implements StrategyPlugin {
       return [];
     }
 
-    const grossEdgeBps = ((sell.bid - buy.ask) / buy.ask) * 10_000;
+    const grossEdgeBps = calculateGrossEdgeBps(buy.ask, sell.bid);
+    if (grossEdgeBps === null) {
+      return [];
+    }
 
     return [
       {
