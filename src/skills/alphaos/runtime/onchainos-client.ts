@@ -389,6 +389,7 @@ export class OnchainOsClient {
         ["ROUTE_MISMATCH", "SIMULATE_FAILED", "SELL_AMOUNT_INVALID", "DUAL_LEG_PARTIAL"].includes(
           apiError.code ?? "",
         );
+      const errorType = this.resolveExecutionErrorType(apiError, knownValidationCode);
       return {
         success: false,
         txHash: "",
@@ -397,7 +398,7 @@ export class OnchainOsClient {
         feeUsd: 0,
         netUsd: 0,
         error: String(error),
-        errorType: knownValidationCode ? "validation" : apiError instanceof OnchainApiError ? "network" : "unknown",
+        errorType,
       };
     }
   }
@@ -1114,16 +1115,9 @@ export class OnchainOsClient {
       ...(bodyText ? { body: bodyText } : {}),
     });
     if (!response.ok) {
-      const responseText = await response.text();
-      throw new OnchainApiError(
-        `request failed ${response.status} ${url.pathname}: ${responseText.slice(0, 280)}`,
-        response.status,
-        this.extractErrorCode(responseText),
-        url.pathname,
-      );
+      throw await this.parseApiErrorResponse(response, url.pathname);
     }
-    const raw = (await response.json()) as unknown;
-    return this.pickPayload(raw) as T;
+    return this.parseApiResponse<T>(response);
   }
 
   private async requestWithFallback<T>(params: {
@@ -1189,21 +1183,13 @@ export class OnchainOsClient {
         });
 
         if (response.ok) {
-          const raw = (await response.json()) as unknown;
-          const payload = this.pickPayload(raw) as T;
+          const payload = await this.parseApiResponse<T>(response);
           this.diagnostics.lastUsedPath = path;
           this.diagnostics.lastV6SuccessAt = mode === "v6" ? new Date().toISOString() : this.diagnostics.lastV6SuccessAt;
           return { ok: true, data: payload };
         }
 
-        const responseText = await response.text();
-        const parsedCode = this.extractErrorCode(responseText);
-        const error = new OnchainApiError(
-          `request failed ${response.status} ${path}: ${responseText.slice(0, 280)}`,
-          response.status,
-          parsedCode,
-          path,
-        );
+        const error = await this.parseApiErrorResponse(response, path);
         if (![404, 405].includes(response.status)) {
           fallbackEligible = false;
         }
@@ -1218,6 +1204,21 @@ export class OnchainOsClient {
     }
 
     return { ok: false, fallbackEligible, error: lastError };
+  }
+
+  private async parseApiResponse<T>(response: Response): Promise<T> {
+    const raw = (await response.json()) as unknown;
+    return this.pickPayload(raw) as T;
+  }
+
+  private async parseApiErrorResponse(response: Response, path: string): Promise<OnchainApiError> {
+    const responseText = await response.text();
+    return new OnchainApiError(
+      `request failed ${response.status} ${path}: ${responseText.slice(0, 280)}`,
+      response.status,
+      this.extractErrorCode(responseText),
+      path,
+    );
   }
 
   private extractErrorCode(text: string): string | undefined {
@@ -1235,6 +1236,19 @@ export class OnchainOsClient {
   private recordError(error: unknown): void {
     this.diagnostics.lastError = String(error);
     this.diagnostics.lastErrorAt = new Date().toISOString();
+  }
+
+  private resolveExecutionErrorType(
+    error: unknown,
+    knownValidationCode: boolean,
+  ): "validation" | "network" | "unknown" {
+    if (knownValidationCode) {
+      return "validation";
+    }
+    if (error instanceof OnchainApiError) {
+      return "network";
+    }
+    return "unknown";
   }
 
   private getProbeFailureStep(error: unknown): "token" | "quote" | "swap" | "simulate" {
