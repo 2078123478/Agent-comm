@@ -53,6 +53,9 @@ export interface SimulationResult {
   feeUsd: number;
   netUsd: number;
   netEdgeBps: number;
+  pFail: number;
+  expectedShortfall: number;
+  latencyAdjustedNetUsd: number;
   pass: boolean;
   reason: string;
 }
@@ -86,6 +89,8 @@ export interface ScanContext {
 
 export interface EvalContext {
   mode: ExecutionMode;
+  quotes?: Quote[];
+  nowIso?: string;
 }
 
 export interface PlanContext {

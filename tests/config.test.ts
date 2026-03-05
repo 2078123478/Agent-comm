@@ -36,4 +36,19 @@ describe("loadConfig security defaults", () => {
     expect(config.onchainRelayUrl).toBe("https://relay.example");
     expect(config.onchainUsePrivateSubmit).toBe(true);
   });
+
+  it("reads cost-model parameters from env", () => {
+    process.env.MEV_PENALTY_BPS = "7";
+    process.env.LIQUIDITY_USD_DEFAULT = "900000";
+    process.env.VOLATILITY_DEFAULT = "0.05";
+    process.env.AVG_LATENCY_MS_DEFAULT = "320";
+    process.env.EVAL_NOTIONAL_USD_DEFAULT = "1800";
+
+    const config = loadConfig();
+    expect(config.mevPenaltyBps).toBe(7);
+    expect(config.liquidityUsdDefault).toBe(900000);
+    expect(config.volatilityDefault).toBe(0.05);
+    expect(config.avgLatencyMsDefault).toBe(320);
+    expect(config.evalNotionalUsdDefault).toBe(1800);
+  });
 });

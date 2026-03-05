@@ -4,6 +4,7 @@ import type {
   ExecutionMode,
   GateCheck,
   Opportunity,
+  Quote,
   RiskPolicy,
   SimulationResult,
   SkillManifest,
@@ -255,7 +256,7 @@ export class AlphaEngine {
   private async processOpportunity(
     plugin: StrategyPlugin,
     opportunity: Opportunity,
-    quotes: Array<{ gasUsd: number; dex: string }>,
+    quotes: Quote[],
   ): Promise<void> {
     const quoteGas = quotes.find((q) => q.dex === opportunity.buyDex)?.gasUsd ?? 1;
     this.store.insertOpportunity(opportunity, quoteGas, 0, "detected");
@@ -267,7 +268,11 @@ export class AlphaEngine {
       strategyId: plugin.id,
     });
 
-    const evalResult = await plugin.evaluate(opportunity, { mode: this.mode });
+    const evalResult = await plugin.evaluate(opportunity, {
+      mode: this.mode,
+      quotes,
+      nowIso: new Date().toISOString(),
+    });
     if (!evalResult.accepted) {
       this.store.updateOpportunityStatus(opportunity.id, "rejected");
       return;

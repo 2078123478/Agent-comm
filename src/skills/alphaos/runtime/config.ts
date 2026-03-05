@@ -101,6 +101,11 @@ export interface AlphaOsConfig {
   slippageBps: number;
   takerFeeBps: number;
   gasUsdDefault: number;
+  mevPenaltyBps: number;
+  liquidityUsdDefault: number;
+  volatilityDefault: number;
+  avgLatencyMsDefault: number;
+  evalNotionalUsdDefault: number;
   autoPromoteToLive: boolean;
   riskPolicy: RiskPolicy;
   strategyProfileDefaults: Record<string, unknown>;
@@ -143,6 +148,11 @@ export function loadConfig(): AlphaOsConfig {
     slippageBps: readNumber("SLIPPAGE_BPS", 12),
     takerFeeBps: readNumber("TAKER_FEE_BPS", 20),
     gasUsdDefault: readNumber("GAS_USD_DEFAULT", 1.25),
+    mevPenaltyBps: readNumber("MEV_PENALTY_BPS", 5),
+    liquidityUsdDefault: readNumber("LIQUIDITY_USD_DEFAULT", 250000),
+    volatilityDefault: readNumber("VOLATILITY_DEFAULT", 0.02),
+    avgLatencyMsDefault: readNumber("AVG_LATENCY_MS_DEFAULT", 250),
+    evalNotionalUsdDefault: readNumber("EVAL_NOTIONAL_USD_DEFAULT", 1000),
     autoPromoteToLive: readBoolean("AUTO_PROMOTE_TO_LIVE", false),
     riskPolicy: {
       minNetEdgeBpsPaper: readNumber("MIN_NET_EDGE_BPS_PAPER", 45),

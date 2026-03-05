@@ -16,7 +16,17 @@ function buildPlugins(config: AlphaOsConfig, store: StateStore): StrategyPlugin[
   const enabled = new Set(config.enabledStrategies);
 
   if (enabled.has("dex-arbitrage")) {
-    plugins.push(new DexArbitragePlugin());
+    plugins.push(
+      new DexArbitragePlugin({
+        takerFeeBps: config.takerFeeBps,
+        mevPenaltyBps: config.mevPenaltyBps,
+        riskPolicy: config.riskPolicy,
+        liquidityUsdDefault: config.liquidityUsdDefault,
+        volatilityDefault: config.volatilityDefault,
+        avgLatencyMsDefault: config.avgLatencyMsDefault,
+        evalNotionalUsdDefault: config.evalNotionalUsdDefault,
+      }),
+    );
   }
 
   if (enabled.has("smart-money-mirror")) {
@@ -24,7 +34,17 @@ function buildPlugins(config: AlphaOsConfig, store: StateStore): StrategyPlugin[
   }
 
   if (plugins.length === 0) {
-    plugins.push(new DexArbitragePlugin());
+    plugins.push(
+      new DexArbitragePlugin({
+        takerFeeBps: config.takerFeeBps,
+        mevPenaltyBps: config.mevPenaltyBps,
+        riskPolicy: config.riskPolicy,
+        liquidityUsdDefault: config.liquidityUsdDefault,
+        volatilityDefault: config.volatilityDefault,
+        avgLatencyMsDefault: config.avgLatencyMsDefault,
+        evalNotionalUsdDefault: config.evalNotionalUsdDefault,
+      }),
+    );
   }
 
   return plugins;
@@ -86,6 +106,10 @@ export function createAlphaOsSkill(config: AlphaOsConfig, logger: Logger) {
     slippageBps: config.slippageBps,
     takerFeeBps: config.takerFeeBps,
     gasUsdDefault: config.gasUsdDefault,
+    mevPenaltyBps: config.mevPenaltyBps,
+    liquidityUsdDefault: config.liquidityUsdDefault,
+    volatilityDefault: config.volatilityDefault,
+    avgLatencyMsDefault: config.avgLatencyMsDefault,
   });
   const riskEngine = new RiskEngine(config.riskPolicy);
   const notifier = new OpenClawNotifier(store, {

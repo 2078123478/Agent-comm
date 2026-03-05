@@ -2,11 +2,15 @@ import { describe, expect, it } from "vitest";
 import { Simulator } from "../src/skills/alphaos/runtime/simulator";
 
 describe("Simulator", () => {
-  it("computes net edge and pass status", () => {
+  it("applies dual-leg realistic costs and risk fields", () => {
     const simulator = new Simulator({
       slippageBps: 10,
       takerFeeBps: 20,
       gasUsdDefault: 1,
+      mevPenaltyBps: 5,
+      liquidityUsdDefault: 1_000_000,
+      volatilityDefault: 0,
+      avgLatencyMsDefault: 100,
     });
 
     const result = simulator.estimate(
@@ -30,8 +34,14 @@ describe("Simulator", () => {
       },
     );
 
-    expect(result.grossUsd).toBeGreaterThan(0);
-    expect(result.netEdgeBps).toBeGreaterThan(45);
+    expect(result.grossUsd).toBeCloseTo(14, 6);
+    expect(result.feeUsd).toBeCloseTo(7.1632455532, 6);
+    expect(result.netUsd).toBeCloseTo(6.8367544468, 6);
+    expect(result.netEdgeBps).toBeCloseTo(68.367544468, 6);
+    expect(result.latencyAdjustedNetUsd).toBeCloseTo(6.6967544468, 6);
+    expect(result.pFail).toBeGreaterThan(0);
+    expect(result.pFail).toBeLessThan(1);
+    expect(result.expectedShortfall).toBeGreaterThan(0);
     expect(result.pass).toBe(true);
   });
 });

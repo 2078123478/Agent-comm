@@ -1,31 +1,79 @@
 import type { ExecutionMode, ExecutionPlan, RiskPolicy, SimulationResult } from "../types";
+import {
+  calculateCostBreakdown,
+  estimateExpectedShortfall,
+  estimateFailureProbability,
+} from "./cost-model";
 
 export interface SimulatorOptions {
   slippageBps: number;
   takerFeeBps: number;
   gasUsdDefault: number;
+  mevPenaltyBps?: number;
+  liquidityUsdDefault?: number;
+  volatilityDefault?: number;
+  avgLatencyMsDefault?: number;
+}
+
+function asNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 export class Simulator {
   constructor(private readonly options: SimulatorOptions) {}
 
   estimate(plan: ExecutionPlan, mode: ExecutionMode, risk: RiskPolicy): SimulationResult {
+    const metadata = plan.metadata ?? {};
+    const grossEdgeBps =
+      plan.buyPrice > 0 ? ((plan.sellPrice - plan.buyPrice) / plan.buyPrice) * 10_000 : 0;
     const grossUsd = ((plan.sellPrice - plan.buyPrice) / plan.buyPrice) * plan.notionalUsd;
-    const feeUsd =
-      plan.notionalUsd * (2 * this.options.takerFeeBps) / 10_000 +
-      plan.notionalUsd * this.options.slippageBps / 10_000 +
-      this.options.gasUsdDefault;
+    const gasBuy = asNumber(metadata.gasBuyUsd) ?? this.options.gasUsdDefault;
+    const gasSell = asNumber(metadata.gasSellUsd) ?? this.options.gasUsdDefault;
+    const liquidityUsd =
+      asNumber(metadata.liquidityUsd) ??
+      this.options.liquidityUsdDefault ??
+      Math.max(1000, (plan.notionalUsd * 10_000) / Math.max(1, this.options.slippageBps));
+    const volatility = asNumber(metadata.volatility) ?? this.options.volatilityDefault ?? 0.02;
+    const avgLatencyMs = asNumber(metadata.avgLatencyMs) ?? this.options.avgLatencyMsDefault ?? 250;
+    const breakdown = calculateCostBreakdown({
+      grossEdgeBps,
+      notionalUsd: plan.notionalUsd,
+      takerFeeBps: this.options.takerFeeBps,
+      mevPenaltyBps: this.options.mevPenaltyBps ?? 5,
+      liquidityUsd,
+      volatility,
+      avgLatencyMs,
+      gasBuyUsd: gasBuy,
+      gasSellUsd: gasSell,
+    });
+    const feeUsd = breakdown.totalCostUsd;
     const netUsd = grossUsd - feeUsd;
-    const netEdgeBps = (netUsd / plan.notionalUsd) * 10_000;
+    const latencyPenaltyUsd = plan.notionalUsd * breakdown.latencyPenaltyBps / 10_000;
+    const latencyAdjustedNetUsd = netUsd - latencyPenaltyUsd;
+    const netEdgeBps = plan.notionalUsd > 0 ? (netUsd / plan.notionalUsd) * 10_000 : -Infinity;
+    const latencyAdjustedNetEdgeBps =
+      plan.notionalUsd > 0 ? (latencyAdjustedNetUsd / plan.notionalUsd) * 10_000 : -Infinity;
+    const pFail = estimateFailureProbability(avgLatencyMs, latencyAdjustedNetEdgeBps, volatility);
+    const expectedShortfall = estimateExpectedShortfall(
+      plan.notionalUsd,
+      pFail,
+      feeUsd,
+      latencyAdjustedNetEdgeBps,
+    );
     const min = mode === "live" ? risk.minNetEdgeBpsLive : risk.minNetEdgeBpsPaper;
-    const pass = netEdgeBps >= min;
+    const pass = latencyAdjustedNetEdgeBps >= min;
     return {
       grossUsd,
       feeUsd,
       netUsd,
       netEdgeBps,
+      pFail,
+      expectedShortfall,
+      latencyAdjustedNetUsd,
       pass,
-      reason: pass ? "net edge passed" : `net edge ${netEdgeBps.toFixed(2)}bps below ${min}bps`,
+      reason: pass
+        ? `latency-adjusted net edge ${latencyAdjustedNetEdgeBps.toFixed(2)}bps passed`
+        : `latency-adjusted net edge ${latencyAdjustedNetEdgeBps.toFixed(2)}bps below ${min}bps`,
     };
   }
 }

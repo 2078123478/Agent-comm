@@ -1,0 +1,107 @@
+export interface CostModelInput {
+  grossEdgeBps: number;
+  notionalUsd: number;
+  takerFeeBps: number;
+  mevPenaltyBps: number;
+  liquidityUsd: number;
+  volatility: number;
+  avgLatencyMs: number;
+  gasBuyUsd: number;
+  gasSellUsd: number;
+}
+
+export interface CostModelBreakdown {
+  feeBps: number;
+  slippagePerLegBps: number;
+  slippageBps: number;
+  latencyPenaltyBps: number;
+  mevPenaltyBps: number;
+  netEdgeBps: number;
+  tradeFeeBuyUsd: number;
+  tradeFeeSellUsd: number;
+  slippageBuyUsd: number;
+  slippageSellUsd: number;
+  mevUsd: number;
+  totalCostUsd: number;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+export function estimateSlippage(notionalUsd: number, liquidityUsd: number, volatility: number): number {
+  const safeNotional = Math.max(0, notionalUsd);
+  const safeLiquidity = Math.max(liquidityUsd, 1000);
+  const safeVolatility = Math.max(0, volatility);
+  const baseBps = 3;
+  const impactExponent = 0.5;
+  return baseBps + Math.pow(safeNotional / safeLiquidity, impactExponent) * 10 * (1 + safeVolatility);
+}
+
+export function estimateLatencyPenalty(avgLatencyMs: number, edgeBps: number): number {
+  const decayPer100ms = 0.01;
+  return Math.max(0, edgeBps) * decayPer100ms * (Math.max(0, avgLatencyMs) / 100);
+}
+
+export function calculateCostBreakdown(input: CostModelInput): CostModelBreakdown {
+  const safeNotional = Math.max(0, input.notionalUsd);
+  const feeBps = Math.max(0, input.takerFeeBps) * 2;
+  const mevPenaltyBps = Math.max(0, input.mevPenaltyBps);
+  const slippagePerLegBps = estimateSlippage(safeNotional, input.liquidityUsd, input.volatility);
+  const slippageBps = slippagePerLegBps * 2;
+  const latencyPenaltyBps = estimateLatencyPenalty(input.avgLatencyMs, input.grossEdgeBps);
+  const netEdgeBps =
+    input.grossEdgeBps - feeBps - slippageBps - latencyPenaltyBps - mevPenaltyBps;
+  const tradeFeeBuyUsd = safeNotional * Math.max(0, input.takerFeeBps) / 10_000;
+  const tradeFeeSellUsd = safeNotional * Math.max(0, input.takerFeeBps) / 10_000;
+  const slippageBuyUsd = safeNotional * slippagePerLegBps / 10_000;
+  const slippageSellUsd = safeNotional * slippagePerLegBps / 10_000;
+  const mevUsd = safeNotional * mevPenaltyBps / 10_000;
+  const totalCostUsd =
+    Math.max(0, input.gasBuyUsd) +
+    Math.max(0, input.gasSellUsd) +
+    tradeFeeBuyUsd +
+    tradeFeeSellUsd +
+    slippageBuyUsd +
+    slippageSellUsd +
+    mevUsd;
+  return {
+    feeBps,
+    slippagePerLegBps,
+    slippageBps,
+    latencyPenaltyBps,
+    mevPenaltyBps,
+    netEdgeBps,
+    tradeFeeBuyUsd,
+    tradeFeeSellUsd,
+    slippageBuyUsd,
+    slippageSellUsd,
+    mevUsd,
+    totalCostUsd,
+  };
+}
+
+export function estimateFailureProbability(
+  avgLatencyMs: number,
+  netEdgeBps: number,
+  volatility: number,
+): number {
+  const baseFail = 0.03;
+  const latencyRisk = Math.min(0.4, Math.max(0, avgLatencyMs) / 5000 * 0.35);
+  const edgeRisk = netEdgeBps <= 0 ? 0.35 : Math.max(0, (35 - netEdgeBps) / 220);
+  const volRisk = Math.min(0.2, Math.max(0, volatility) * 0.4);
+  return clamp(baseFail + latencyRisk + edgeRisk + volRisk, 0.01, 0.95);
+}
+
+export function estimateExpectedShortfall(
+  notionalUsd: number,
+  pFail: number,
+  totalCostUsd: number,
+  netEdgeBps: number,
+): number {
+  const safeNotional = Math.max(0, notionalUsd);
+  const safePFail = clamp(pFail, 0, 1);
+  const tailMoveBps = Math.max(12, Math.abs(Math.min(netEdgeBps, 0)) * 0.8 + 12);
+  const tailMoveUsd = safeNotional * tailMoveBps / 10_000;
+  return safePFail * (Math.max(0, totalCostUsd) + tailMoveUsd);
+}
