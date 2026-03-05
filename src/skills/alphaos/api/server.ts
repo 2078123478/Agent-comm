@@ -1,4 +1,5 @@
 import express from "express";
+import crypto from "node:crypto";
 import type { AlphaEngine } from "../engine/alpha-engine";
 import { OnchainOsClient } from "../runtime/onchainos-client";
 import { StateStore } from "../runtime/state-store";
@@ -60,6 +61,33 @@ function toCsv(rows: BacktestSnapshotRow[]): string {
     );
   }
   return `${lines.join("\n")}\n`;
+}
+
+function parseBoolean(input: unknown, fallback: boolean): boolean {
+  if (typeof input !== "string") {
+    return fallback;
+  }
+  return ["1", "true", "yes", "on"].includes(input.toLowerCase());
+}
+
+function secureEquals(left: string, right: string): boolean {
+  const leftBuffer = Buffer.from(left);
+  const rightBuffer = Buffer.from(right);
+  if (leftBuffer.length !== rightBuffer.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function isAuthorized(authorization: string | undefined, secret: string): boolean {
+  if (!secret || !authorization) {
+    return false;
+  }
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+  if (!match) {
+    return false;
+  }
+  return secureEquals(match[1], secret);
 }
 
 function demoHtml(): string {
@@ -272,10 +300,21 @@ function demoHtml(): string {
       el.mode.textContent = data.mode;
       el.mode.className = "kpi " + (data.mode === "live" ? "" : "warn");
 
-      const chips = (data.strategies || [])
-        .map((s) => '<span class="chip">' + s.strategyId + ': ' + Number(s.netUsd || 0).toFixed(2) + '</span>')
-        .join("");
-      el.strategies.innerHTML = chips || "<span class='warn'>No strategy stats yet</span>";
+      const strategies = Array.isArray(data.strategies) ? data.strategies : [];
+      el.strategies.replaceChildren();
+      if (strategies.length === 0) {
+        const empty = document.createElement("span");
+        empty.className = "warn";
+        empty.textContent = "No strategy stats yet";
+        el.strategies.appendChild(empty);
+      } else {
+        for (const s of strategies) {
+          const chip = document.createElement("span");
+          chip.className = "chip";
+          chip.textContent = String(s.strategyId || "unknown") + ": " + Number(s.netUsd || 0).toFixed(2);
+          el.strategies.appendChild(chip);
+        }
+      }
 
       if (data.share) {
         el.share.textContent = data.share.text;
@@ -293,10 +332,35 @@ export function createServer(
   engine: AlphaEngine,
   store: StateStore,
   manifest: SkillManifest,
-  options?: { defaultRiskPolicy?: RiskPolicy; onchainClient?: OnchainOsClient },
+  options?: {
+    defaultRiskPolicy?: RiskPolicy;
+    onchainClient?: OnchainOsClient;
+    apiSecret?: string;
+    demoPublic?: boolean;
+  },
 ) {
   const app = express();
   app.use(express.json({ limit: "512kb" }));
+  const apiSecret = options?.apiSecret ?? process.env.API_SECRET ?? "";
+  const demoPublic = options?.demoPublic ?? parseBoolean(process.env.DEMO_PUBLIC, false);
+
+  const requireApiAuth: express.RequestHandler = (req, res, next) => {
+    if (isAuthorized(req.header("authorization"), apiSecret)) {
+      next();
+      return;
+    }
+    res.setHeader("WWW-Authenticate", "Bearer");
+    res.status(401).json({ error: "unauthorized" });
+  };
+
+  const requireDemoAuthIfPrivate: express.RequestHandler = (req, res, next) => {
+    if (demoPublic) {
+      next();
+      return;
+    }
+    requireApiAuth(req, res, next);
+  };
+
   const replay = new SandboxReplayService(store, options?.defaultRiskPolicy ?? {
     minNetEdgeBpsPaper: 45,
     minNetEdgeBpsLive: 60,
@@ -309,16 +373,16 @@ export function createServer(
     res.json({ ok: true, mode: engine.getCurrentMode(), service: "alphaos", strategies: manifest.strategyIds });
   });
 
-  app.get("/demo", (_req, res) => {
+  app.get("/demo", requireDemoAuthIfPrivate, (_req, res) => {
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.send(demoHtml());
   });
 
-  app.get("/api/v1/manifest", (_req, res) => {
+  app.get("/api/v1/manifest", requireApiAuth, (_req, res) => {
     res.json(manifest);
   });
 
-  app.get("/api/v1/integration/onchainos/status", (_req, res) => {
+  app.get("/api/v1/integration/onchainos/status", requireApiAuth, (_req, res) => {
     if (!options?.onchainClient) {
       res.status(503).json({ error: "onchain client unavailable" });
       return;
@@ -326,7 +390,7 @@ export function createServer(
     res.json(options.onchainClient.getIntegrationStatus());
   });
 
-  app.post("/api/v1/integration/onchainos/probe", async (req, res) => {
+  app.post("/api/v1/integration/onchainos/probe", requireApiAuth, async (req, res) => {
     if (!options?.onchainClient) {
       res.status(503).json({ error: "onchain client unavailable" });
       return;
@@ -348,7 +412,7 @@ export function createServer(
     res.status(result.ok ? 200 : 503).json(result);
   });
 
-  app.get("/api/v1/integration/onchainos/token-cache", (req, res) => {
+  app.get("/api/v1/integration/onchainos/token-cache", requireApiAuth, (req, res) => {
     const symbol = typeof req.query.symbol === "string" ? req.query.symbol.trim().toUpperCase() : undefined;
     const chainIndex = typeof req.query.chainIndex === "string" ? req.query.chainIndex.trim() : undefined;
     const limit = toLimit(req.query.limit, 100);
@@ -357,7 +421,7 @@ export function createServer(
     });
   });
 
-  app.get("/api/v1/stream/metrics", (req, res) => {
+  app.get("/api/v1/stream/metrics", requireDemoAuthIfPrivate, (req, res) => {
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
@@ -380,6 +444,8 @@ export function createServer(
       res.end();
     });
   });
+
+  app.use("/api/v1", requireApiAuth);
 
   app.post("/api/v1/engine/mode", (req, res) => {
     const mode = req.body?.mode;
@@ -514,7 +580,11 @@ export function createServer(
   app.get("/api/v1/signals/whale", (req, res) => {
     const rawStatus = String(req.query.status ?? "all");
     const status =
-      rawStatus === "pending" || rawStatus === "consumed" || rawStatus === "ignored" || rawStatus === "all"
+      rawStatus === "pending" ||
+      rawStatus === "processing" ||
+      rawStatus === "consumed" ||
+      rawStatus === "ignored" ||
+      rawStatus === "all"
         ? rawStatus
         : "all";
     const limit = toLimit(req.query.limit, 50);

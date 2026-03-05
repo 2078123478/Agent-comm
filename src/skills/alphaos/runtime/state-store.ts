@@ -446,55 +446,40 @@ export class StateStore {
   }
 
   insertTrade(opportunityId: string, mode: ExecutionMode, trade: TradeResult, createdAt: string): void {
-    this.alphaDb
-      .prepare(
-        `INSERT INTO trades (
-          id, opportunity_id, mode, tx_hash, status, gross_usd, fee_usd, net_usd, created_at, settled_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-      .run(
-        crypto.randomUUID(),
-        opportunityId,
-        mode,
-        trade.txHash,
-        trade.status,
-        trade.grossUsd,
-        trade.feeUsd,
-        trade.netUsd,
-        createdAt,
-        createdAt,
-      );
-
     const day = utcDay(new Date(createdAt));
-    const existing = this.alphaDb
-      .prepare("SELECT gross_usd, fee_usd, net_usd, trades_count FROM pnl_daily WHERE day = ? AND mode = ?")
-      .get(day, mode) as
-      | { gross_usd: number; fee_usd: number; net_usd: number; trades_count: number }
-      | undefined;
-
-    if (!existing) {
+    const transaction = this.alphaDb.transaction(() => {
       this.alphaDb
         .prepare(
-          "INSERT INTO pnl_daily (day, mode, gross_usd, fee_usd, net_usd, trades_count) VALUES (?, ?, ?, ?, ?, ?)",
+          `INSERT INTO trades (
+            id, opportunity_id, mode, tx_hash, status, gross_usd, fee_usd, net_usd, created_at, settled_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
-        .run(day, mode, trade.grossUsd, trade.feeUsd, trade.netUsd, 1);
-      return;
-    }
+        .run(
+          crypto.randomUUID(),
+          opportunityId,
+          mode,
+          trade.txHash,
+          trade.status,
+          trade.grossUsd,
+          trade.feeUsd,
+          trade.netUsd,
+          createdAt,
+          createdAt,
+        );
 
-    this.alphaDb
-      .prepare(
-        `UPDATE pnl_daily
-         SET gross_usd = ?, fee_usd = ?, net_usd = ?, trades_count = ?
-         WHERE day = ? AND mode = ?`,
-      )
-      .run(
-        existing.gross_usd + trade.grossUsd,
-        existing.fee_usd + trade.feeUsd,
-        existing.net_usd + trade.netUsd,
-        existing.trades_count + 1,
-        day,
-        mode,
-      );
+      this.alphaDb
+        .prepare(
+          `INSERT INTO pnl_daily (day, mode, gross_usd, fee_usd, net_usd, trades_count)
+           VALUES (?, ?, ?, ?, ?, 1)
+           ON CONFLICT(day, mode) DO UPDATE SET
+             gross_usd = pnl_daily.gross_usd + excluded.gross_usd,
+             fee_usd = pnl_daily.fee_usd + excluded.fee_usd,
+             net_usd = pnl_daily.net_usd + excluded.net_usd,
+             trades_count = pnl_daily.trades_count + 1`,
+        )
+        .run(day, mode, trade.grossUsd, trade.feeUsd, trade.netUsd);
+    });
+    transaction();
   }
 
   insertAlert(level: string, eventType: string, message: string): void {
@@ -793,7 +778,7 @@ export class StateStore {
     return id;
   }
 
-  listWhaleSignals(status: "pending" | "consumed" | "ignored" | "all", limit: number): WhaleSignal[] {
+  listWhaleSignals(status: "pending" | "processing" | "consumed" | "ignored" | "all", limit: number): WhaleSignal[] {
     const sql =
       status === "all"
         ? `SELECT id, wallet, token, side, size_usd AS sizeUsd, confidence, source_tx_hash AS sourceTxHash,
@@ -807,22 +792,39 @@ export class StateStore {
       : this.alphaDb.prepare(sql).all(status, limit)) as WhaleSignal[];
   }
 
-  getPendingWhaleSignals(limit: number): WhaleSignal[] {
-    return this.alphaDb
-      .prepare(
-        `SELECT id, wallet, token, side, size_usd AS sizeUsd, confidence, source_tx_hash AS sourceTxHash,
-                status, received_at AS receivedAt, processed_at AS processedAt
-         FROM whale_signals
-         WHERE status = 'pending'
-         ORDER BY received_at ASC
-         LIMIT ?`,
-      )
-      .all(limit) as WhaleSignal[];
+  claimPendingWhaleSignals(limit: number): WhaleSignal[] {
+    const safeLimit = Math.max(1, Math.min(1000, Math.floor(limit)));
+    const now = new Date().toISOString();
+    const transaction = this.alphaDb.transaction(() => {
+      const signals = this.alphaDb
+        .prepare(
+          `SELECT id, wallet, token, side, size_usd AS sizeUsd, confidence, source_tx_hash AS sourceTxHash,
+                  status, received_at AS receivedAt, processed_at AS processedAt
+           FROM whale_signals
+           WHERE status = 'pending'
+           ORDER BY received_at ASC
+           LIMIT ?`,
+        )
+        .all(safeLimit) as WhaleSignal[];
+
+      for (const signal of signals) {
+        this.alphaDb
+          .prepare("UPDATE whale_signals SET status = 'processing', processed_at = ? WHERE id = ? AND status = 'pending'")
+          .run(now, signal.id);
+      }
+
+      return signals.map((signal) => ({
+        ...signal,
+        status: "processing" as const,
+        processedAt: now,
+      }));
+    });
+    return transaction();
   }
 
   updateWhaleSignalStatus(id: string, status: "consumed" | "ignored"): void {
     this.alphaDb
-      .prepare("UPDATE whale_signals SET status = ?, processed_at = ? WHERE id = ?")
+      .prepare("UPDATE whale_signals SET status = ?, processed_at = ? WHERE id = ? AND status = 'processing'")
       .run(status, new Date().toISOString(), id);
   }
 

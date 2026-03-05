@@ -130,7 +130,7 @@ export interface WhaleSignal {
   sizeUsd: number;
   confidence: number;
   sourceTxHash?: string;
-  status: "pending" | "consumed" | "ignored";
+  status: "pending" | "processing" | "consumed" | "ignored";
   receivedAt: string;
   processedAt?: string;
 }

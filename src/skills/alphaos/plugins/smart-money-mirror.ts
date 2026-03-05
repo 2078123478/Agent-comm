@@ -32,7 +32,7 @@ export class SmartMoneyMirrorPlugin implements StrategyPlugin {
   ) {}
 
   async scan(_ctx: ScanContext): Promise<Opportunity[]> {
-    const signals = this.store.getPendingWhaleSignals(8);
+    const signals = this.store.claimPendingWhaleSignals(8);
     const opportunities: Opportunity[] = [];
 
     for (const signal of signals) {

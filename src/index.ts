@@ -43,6 +43,8 @@ async function run(): Promise<void> {
   const app = createServer(skill.engine, skill.store, skill.manifest, {
     defaultRiskPolicy: config.riskPolicy,
     onchainClient: skill.onchain,
+    apiSecret: config.apiSecret,
+    demoPublic: config.demoPublic,
   });
 
   skill.engine.start();

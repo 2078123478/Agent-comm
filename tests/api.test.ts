@@ -24,11 +24,21 @@ type ApiResponse = {
   body: unknown;
 };
 
+const TEST_API_SECRET = "unit-test-api-secret";
+
+function authHeaders(secret = TEST_API_SECRET): Record<string, string> {
+  return { authorization: `Bearer ${secret}` };
+}
+
 async function invokeApi(
   app: ReturnType<typeof createServer>,
   method: "GET" | "POST",
   url: string,
   payload?: Record<string, unknown>,
+  options?: {
+    headers?: Record<string, string>;
+    closeAfterFirstChunk?: boolean;
+  },
 ): Promise<ApiResponse> {
   const socket = new PassThrough();
   (socket as { remoteAddress?: string }).remoteAddress = "127.0.0.1";
@@ -36,6 +46,8 @@ async function invokeApi(
   (socket as { destroy: () => PassThrough }).destroy = () => socket;
 
   let raw = "";
+  let closeRequested = false;
+  let req: http.IncomingMessage;
   const write = socket.write.bind(socket);
   (socket as { write: (...args: unknown[]) => boolean }).write = (...args: unknown[]) => {
     const chunk = args[0];
@@ -44,19 +56,26 @@ async function invokeApi(
     } else if (typeof chunk === "string") {
       raw += chunk;
     }
+    if (options?.closeAfterFirstChunk && !closeRequested && raw.includes("\r\n\r\n")) {
+      closeRequested = true;
+      setImmediate(() => req.emit("close"));
+    }
     return write(...(args as Parameters<typeof write>));
   };
 
-  const req = new http.IncomingMessage(socket as never);
+  req = new http.IncomingMessage(socket as never);
   req.method = method;
   req.url = url;
   req.headers = {};
+  for (const [key, value] of Object.entries(options?.headers ?? {})) {
+    req.headers[key.toLowerCase()] = value;
+  }
   const payloadText = payload ? JSON.stringify(payload) : undefined;
   if (payloadText) {
     req.push(payloadText);
   }
   if (payload) {
-    req.headers["content-type"] = "application/json";
+    req.headers["content-type"] = req.headers["content-type"] ?? "application/json";
     req.headers["content-length"] = String(Buffer.byteLength(payloadText ?? ""));
   }
   req.push(null);
@@ -124,7 +143,7 @@ async function invokeApi(
 }
 
 describe("API server", () => {
-  it("accepts whale signals and exposes them", async () => {
+  it("requires bearer auth for protected APIs", async () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "alphaos-api-"));
     const store = new StateStore(tempDir);
     stores.push(store);
@@ -158,29 +177,137 @@ describe("API server", () => {
       store,
     });
 
-    const app = createServer(engine as never, store, manifest, { onchainClient });
+    const app = createServer(engine as never, store, manifest, {
+      onchainClient,
+      apiSecret: TEST_API_SECRET,
+      demoPublic: false,
+    });
 
-    const createResp = await invokeApi(app, "POST", "/api/v1/signals/whale", {
+    const createUnauthorized = await invokeApi(app, "POST", "/api/v1/signals/whale", {
       wallet: "0xabc",
       token: "ETH",
       side: "buy",
       sizeUsd: 100000,
       confidence: 0.91,
     });
+    expect(createUnauthorized.status).toBe(401);
+
+    const createResp = await invokeApi(
+      app,
+      "POST",
+      "/api/v1/signals/whale",
+      {
+        wallet: "0xabc",
+        token: "ETH",
+        side: "buy",
+        sizeUsd: 100000,
+        confidence: 0.91,
+      },
+      { headers: authHeaders() },
+    );
 
     expect(createResp.status).toBe(202);
 
-    const listResp = await invokeApi(app, "GET", "/api/v1/signals/whale?status=pending");
+    const listResp = await invokeApi(
+      app,
+      "GET",
+      "/api/v1/signals/whale?status=pending",
+      undefined,
+      { headers: authHeaders() },
+    );
     expect(listResp.status).toBe(200);
     expect((listResp.body as { items: unknown[] }).items.length).toBe(1);
 
-    const shareResp = await invokeApi(app, "GET", "/api/v1/growth/share/latest");
+    const shareResp = await invokeApi(
+      app,
+      "GET",
+      "/api/v1/growth/share/latest",
+      undefined,
+      { headers: authHeaders() },
+    );
     expect(shareResp.status).toBe(404);
 
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
-  it("updates strategy profiles and exports backtest snapshot", async () => {
+  it("keeps demo + stream public only when DEMO_PUBLIC is true", async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "alphaos-api-"));
+    const store = new StateStore(tempDir);
+    stores.push(store);
+
+    const engine = {
+      getCurrentMode: () => "paper",
+      requestMode: (mode: "paper" | "live"): EngineModeResponse => ({
+        ok: true,
+        requestedMode: mode,
+        currentMode: mode,
+        reasons: [],
+      }),
+    };
+
+    const manifest: SkillManifest = {
+      id: "alphaos",
+      version: "0.2.0",
+      description: "test",
+      strategyIds: ["dex-arbitrage", "smart-money-mirror"],
+    };
+
+    const onchainClient = new OnchainOsClient({
+      authMode: "bearer",
+      apiKeyHeader: "X-API-Key",
+      gasUsdDefault: 1,
+      chainIndex: "196",
+      requireSimulate: true,
+      enableCompatFallback: true,
+      tokenCacheTtlSeconds: 600,
+      tokenProfilePath: "/api/v6/market/token/profile/current",
+      store,
+    });
+
+    const privateDemoApp = createServer(engine as never, store, manifest, {
+      onchainClient,
+      apiSecret: TEST_API_SECRET,
+      demoPublic: false,
+    });
+
+    const privateDemoBlocked = await invokeApi(privateDemoApp, "GET", "/demo");
+    expect(privateDemoBlocked.status).toBe(401);
+
+    const privateStreamBlocked = await invokeApi(privateDemoApp, "GET", "/api/v1/stream/metrics");
+    expect(privateStreamBlocked.status).toBe(401);
+
+    const privateDemoAuthorized = await invokeApi(
+      privateDemoApp,
+      "GET",
+      "/demo",
+      undefined,
+      { headers: authHeaders() },
+    );
+    expect(privateDemoAuthorized.status).toBe(200);
+
+    const publicDemoApp = createServer(engine as never, store, manifest, {
+      onchainClient,
+      apiSecret: TEST_API_SECRET,
+      demoPublic: true,
+    });
+
+    const publicDemo = await invokeApi(publicDemoApp, "GET", "/demo");
+    expect(publicDemo.status).toBe(200);
+
+    const publicStream = await invokeApi(
+      publicDemoApp,
+      "GET",
+      "/api/v1/stream/metrics",
+      undefined,
+      { closeAfterFirstChunk: true },
+    );
+    expect(publicStream.status).toBe(200);
+    expect(publicStream.headers["content-type"]).toContain("text/event-stream");
+
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("updates strategy profiles, exports snapshot, and renders demo without innerHTML", async () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "alphaos-api-"));
     const store = new StateStore(tempDir);
     stores.push(store);
@@ -252,7 +379,11 @@ describe("API server", () => {
       store,
     });
 
-    const app = createServer(engine as never, store, manifest, { onchainClient });
+    const app = createServer(engine as never, store, manifest, {
+      onchainClient,
+      apiSecret: TEST_API_SECRET,
+      demoPublic: true,
+    });
 
     const demoPage = await invokeApi(app, "GET", "/demo");
     expect(demoPage.status).toBe(200);
@@ -263,50 +394,102 @@ describe("API server", () => {
     expect(demoPage.text).toContain("可用");
     expect(demoPage.text).toContain("受限");
     expect(demoPage.text).toContain("降级");
+    expect(demoPage.text).not.toContain("innerHTML");
 
-    const profileUpdate = await invokeApi(app, "POST", "/api/v1/strategies/profile", {
-      strategyId: "dex-arbitrage",
-      variant: "B",
-      params: { notionalMultiplier: 1.4 },
-    });
+    const metricsUnauthorized = await invokeApi(app, "GET", "/api/v1/metrics/today");
+    expect(metricsUnauthorized.status).toBe(401);
+
+    const profileUpdate = await invokeApi(
+      app,
+      "POST",
+      "/api/v1/strategies/profile",
+      {
+        strategyId: "dex-arbitrage",
+        variant: "B",
+        params: { notionalMultiplier: 1.4 },
+      },
+      { headers: authHeaders() },
+    );
     expect(profileUpdate.status).toBe(200);
 
-    const profileList = await invokeApi(app, "GET", "/api/v1/strategies/profiles");
+    const profileList = await invokeApi(
+      app,
+      "GET",
+      "/api/v1/strategies/profiles",
+      undefined,
+      { headers: authHeaders() },
+    );
     expect(profileList.status).toBe(200);
     expect((profileList.body as { items: unknown[] }).items.length).toBeGreaterThan(0);
 
-    const snapshotJson = await invokeApi(app, "GET", "/api/v1/backtest/snapshot?hours=24");
+    const snapshotJson = await invokeApi(
+      app,
+      "GET",
+      "/api/v1/backtest/snapshot?hours=24",
+      undefined,
+      { headers: authHeaders() },
+    );
     expect(snapshotJson.status).toBe(200);
     expect((snapshotJson.body as { rows: unknown[] }).rows.length).toBeGreaterThan(0);
 
-    const snapshotCsv = await invokeApi(app, "GET", "/api/v1/backtest/snapshot?hours=24&format=csv");
+    const snapshotCsv = await invokeApi(
+      app,
+      "GET",
+      "/api/v1/backtest/snapshot?hours=24&format=csv",
+      undefined,
+      { headers: authHeaders() },
+    );
     expect(snapshotCsv.status).toBe(200);
     expect(snapshotCsv.headers["content-type"]).toContain("text/csv");
     expect(snapshotCsv.text).toContain("strategyId");
 
-    const replay = await invokeApi(app, "POST", "/api/v1/replay/sandbox", {
-      seed: "demo-seed",
-      hours: 24,
-      mode: "paper",
-    });
+    const replay = await invokeApi(
+      app,
+      "POST",
+      "/api/v1/replay/sandbox",
+      {
+        seed: "demo-seed",
+        hours: 24,
+        mode: "paper",
+      },
+      { headers: authHeaders() },
+    );
     expect(replay.status).toBe(200);
     expect((replay.body as { seed: string }).seed).toBe("demo-seed");
     expect((replay.body as { total: number }).total).toBeGreaterThan(0);
 
-    const integrationStatus = await invokeApi(app, "GET", "/api/v1/integration/onchainos/status");
+    const integrationStatus = await invokeApi(
+      app,
+      "GET",
+      "/api/v1/integration/onchainos/status",
+      undefined,
+      { headers: authHeaders() },
+    );
     expect(integrationStatus.status).toBe(200);
     expect((integrationStatus.body as { authMode: string }).authMode).toBe("bearer");
 
-    const probe = await invokeApi(app, "POST", "/api/v1/integration/onchainos/probe", {
-      pair: "ETH/USDC",
-      chainIndex: "196",
-      notionalUsd: 25,
-    });
+    const probe = await invokeApi(
+      app,
+      "POST",
+      "/api/v1/integration/onchainos/probe",
+      {
+        pair: "ETH/USDC",
+        chainIndex: "196",
+        notionalUsd: 25,
+      },
+      { headers: authHeaders() },
+    );
     expect(probe.status).toBe(503);
     expect((probe.body as { ok: boolean }).ok).toBe(false);
     expect((probe.body as { configured: boolean }).configured).toBe(false);
 
-    const tokenCache = await invokeApi(app, "GET", "/api/v1/integration/onchainos/token-cache?symbol=ETH&chainIndex=196");
+    const tokenCache = await invokeApi(
+      app,
+      "GET",
+      "/api/v1/integration/onchainos/token-cache?symbol=ETH&chainIndex=196",
+      undefined,
+      { headers: authHeaders() },
+    );
     expect(tokenCache.status).toBe(200);
     expect((tokenCache.body as { items: unknown[] }).items.length).toBe(1);
 

@@ -69,6 +69,8 @@ function readAuthMode(name: string, fallback: OnchainAuthMode): OnchainAuthMode 
 export interface AlphaOsConfig {
   port: number;
   logLevel: string;
+  apiSecret?: string;
+  demoPublic: boolean;
   engineIntervalMs: number;
   pair: string;
   dexes: [string, string];
@@ -105,11 +107,13 @@ export function loadConfig(): AlphaOsConfig {
   return {
     port: readNumber("PORT", 3000),
     logLevel: process.env.LOG_LEVEL ?? "info",
+    apiSecret: process.env.API_SECRET,
+    demoPublic: readBoolean("DEMO_PUBLIC", false),
     engineIntervalMs: readNumber("ENGINE_INTERVAL_MS", 5000),
     pair: process.env.PAIR ?? "ETH/USDC",
     dexes: [process.env.DEX_A ?? "okx-dex-a", process.env.DEX_B ?? "okx-dex-b"],
     startMode: readMode("START_MODE", "paper"),
-    liveEnabled: readBoolean("LIVE_ENABLED", true),
+    liveEnabled: readBoolean("LIVE_ENABLED", false),
     paperStartingBalanceUsd: readNumber("PAPER_START_BALANCE_USD", 10000),
     liveBalanceUsd: readNumber("LIVE_BALANCE_USD", 3000),
     onchainOsApiBase: process.env.ONCHAINOS_API_BASE,
@@ -133,7 +137,7 @@ export function loadConfig(): AlphaOsConfig {
     slippageBps: readNumber("SLIPPAGE_BPS", 12),
     takerFeeBps: readNumber("TAKER_FEE_BPS", 20),
     gasUsdDefault: readNumber("GAS_USD_DEFAULT", 1.25),
-    autoPromoteToLive: readBoolean("AUTO_PROMOTE_TO_LIVE", true),
+    autoPromoteToLive: readBoolean("AUTO_PROMOTE_TO_LIVE", false),
     riskPolicy: {
       minNetEdgeBpsPaper: readNumber("MIN_NET_EDGE_BPS_PAPER", 45),
       minNetEdgeBpsLive: readNumber("MIN_NET_EDGE_BPS_LIVE", 60),
