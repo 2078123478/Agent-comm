@@ -1,0 +1,437 @@
+import type { Logger } from "pino";
+import type {
+  EngineModeResponse,
+  ExecutionMode,
+  GateCheck,
+  Opportunity,
+  RiskPolicy,
+  SimulationResult,
+  SkillManifest,
+  StrategyPlugin,
+} from "../types";
+import { MarketWatch } from "../runtime/market-watch";
+import { Simulator } from "../runtime/simulator";
+import { RiskEngine } from "../runtime/risk-engine";
+import { StateStore } from "../runtime/state-store";
+import { OpenClawNotifier } from "../runtime/notifier";
+import { OnchainOsClient } from "../runtime/onchainos-client";
+
+function asNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function clamp(num: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, num));
+}
+
+interface EngineOptions {
+  intervalMs: number;
+  pair: string;
+  dexes: [string, string];
+  startMode: ExecutionMode;
+  liveEnabled: boolean;
+  autoPromoteToLive: boolean;
+  paperStartingBalanceUsd: number;
+  liveBalanceUsd: number;
+  riskPolicy: RiskPolicy;
+}
+
+interface TradeExecutor {
+  execute(
+    mode: ExecutionMode,
+    plan: {
+      opportunityId: string;
+      strategyId: string;
+      pair: string;
+      buyDex: string;
+      sellDex: string;
+      buyPrice: number;
+      sellPrice: number;
+      notionalUsd: number;
+      metadata?: Record<string, unknown>;
+    },
+    simulation: SimulationResult,
+  ): Promise<{
+    success: boolean;
+    txHash: string;
+    status: "submitted" | "confirmed" | "failed";
+    grossUsd: number;
+    feeUsd: number;
+    netUsd: number;
+    error?: string;
+    errorType?: "permission_denied" | "whitelist_restricted" | "network" | "validation" | "unknown";
+  }>;
+}
+
+class DefaultExecutor implements TradeExecutor {
+  constructor(private readonly client: OnchainOsClient) {}
+
+  async execute(
+    mode: ExecutionMode,
+    plan: {
+      opportunityId: string;
+      strategyId: string;
+      pair: string;
+      buyDex: string;
+      sellDex: string;
+      buyPrice: number;
+      sellPrice: number;
+      notionalUsd: number;
+      metadata?: Record<string, unknown>;
+    },
+    simulation: SimulationResult,
+  ) {
+    if (mode === "paper") {
+      return {
+        success: true,
+        txHash: `paper-${plan.opportunityId}`,
+        status: "confirmed" as const,
+        grossUsd: simulation.grossUsd,
+        feeUsd: simulation.feeUsd,
+        netUsd: simulation.netUsd,
+      };
+    }
+
+    return this.client.executePlan(plan);
+  }
+}
+
+export class AlphaEngine {
+  private mode: ExecutionMode;
+  private desiredMode: ExecutionMode;
+  private timer: NodeJS.Timeout | null = null;
+  private running = false;
+  private consecutiveFailures = 0;
+  private circuitBreakerUntil = 0;
+
+  constructor(
+    private readonly manifest: SkillManifest,
+    private readonly plugins: StrategyPlugin[],
+    private readonly options: EngineOptions,
+    private readonly logger: Logger,
+    private readonly marketWatch: MarketWatch,
+    private readonly simulator: Simulator,
+    private readonly riskEngine: RiskEngine,
+    private readonly store: StateStore,
+    private readonly notifier: OpenClawNotifier,
+    private readonly executor: TradeExecutor,
+  ) {
+    this.mode = options.startMode;
+    this.desiredMode = options.liveEnabled ? "live" : options.startMode;
+  }
+
+  static withDefaultExecutor(
+    manifest: SkillManifest,
+    plugins: StrategyPlugin[],
+    options: EngineOptions,
+    logger: Logger,
+    marketWatch: MarketWatch,
+    simulator: Simulator,
+    riskEngine: RiskEngine,
+    store: StateStore,
+    notifier: OpenClawNotifier,
+    onchainClient: OnchainOsClient,
+  ): AlphaEngine {
+    return new AlphaEngine(
+      manifest,
+      plugins,
+      options,
+      logger,
+      marketWatch,
+      simulator,
+      riskEngine,
+      store,
+      notifier,
+      new DefaultExecutor(onchainClient),
+    );
+  }
+
+  start(): void {
+    this.logger.info(
+      { skill: this.manifest.id, mode: this.mode, strategies: this.plugins.map((p) => p.id) },
+      "alpha engine starting",
+    );
+    this.timer = setInterval(() => {
+      void this.tick();
+    }, this.options.intervalMs);
+    void this.tick();
+  }
+
+  stop(): void {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+  }
+
+  getCurrentMode(): ExecutionMode {
+    return this.mode;
+  }
+
+  requestMode(mode: ExecutionMode): EngineModeResponse {
+    this.desiredMode = mode;
+    if (mode === "paper") {
+      this.mode = "paper";
+      return {
+        ok: true,
+        requestedMode: mode,
+        currentMode: this.mode,
+        reasons: [],
+      };
+    }
+
+    const gate = this.evaluateLiveGate();
+    if (!gate.passed) {
+      this.mode = "paper";
+      return {
+        ok: false,
+        requestedMode: mode,
+        currentMode: this.mode,
+        reasons: gate.reasons,
+      };
+    }
+
+    this.mode = "live";
+    return {
+      ok: true,
+      requestedMode: mode,
+      currentMode: this.mode,
+      reasons: [],
+    };
+  }
+
+  private async tick(): Promise<void> {
+    if (this.running) {
+      return;
+    }
+
+    this.running = true;
+    try {
+      await this.notifier.flushOutbox();
+
+      if (this.circuitBreakerUntil > Date.now()) {
+        this.mode = "paper";
+        return;
+      }
+
+      if (this.desiredMode === "live" && this.options.autoPromoteToLive) {
+        const gate = this.evaluateLiveGate();
+        if (gate.passed && this.mode !== "live") {
+          this.mode = "live";
+          await this.notifier.publish({ mode: "live", level: "info", event: "engine_recovered" });
+        }
+      }
+
+      const quotes = await this.marketWatch.fetch(this.options.pair, this.options.dexes);
+
+      for (const plugin of this.plugins) {
+        try {
+          const opportunities = await plugin.scan({
+            pair: this.options.pair,
+            quotes,
+            nowIso: new Date().toISOString(),
+          });
+
+          for (const opp of opportunities) {
+            await this.processOpportunity(plugin, opp, quotes);
+          }
+        } catch (error) {
+          this.logger.error({ err: error, strategy: plugin.id }, "plugin scan failed");
+          this.store.insertAlert("error", "plugin_scan_failure", `${plugin.id}: ${String(error)}`);
+        }
+      }
+    } catch (error) {
+      this.logger.error({ err: error }, "engine tick failed");
+      this.store.insertAlert("error", "engine_tick_failure", String(error));
+    } finally {
+      this.running = false;
+    }
+  }
+
+  private async processOpportunity(
+    plugin: StrategyPlugin,
+    opportunity: Opportunity,
+    quotes: Array<{ gasUsd: number; dex: string }>,
+  ): Promise<void> {
+    const quoteGas = quotes.find((q) => q.dex === opportunity.buyDex)?.gasUsd ?? 1;
+    this.store.insertOpportunity(opportunity, quoteGas, 0, "detected");
+    await this.notifier.publish({
+      mode: this.mode,
+      level: "info",
+      event: "alpha_found",
+      pair: opportunity.pair,
+      strategyId: plugin.id,
+    });
+
+    const evalResult = await plugin.evaluate(opportunity, { mode: this.mode });
+    if (!evalResult.accepted) {
+      this.store.updateOpportunityStatus(opportunity.id, "rejected");
+      return;
+    }
+
+    const balance = this.mode === "live" ? this.options.liveBalanceUsd : this.options.paperStartingBalanceUsd;
+    const profile = this.store.getStrategyProfile(plugin.id);
+    const rawPlan = await plugin.plan(evalResult, {
+      balanceUsd: balance,
+      riskPolicy: this.options.riskPolicy,
+    });
+
+    if (!rawPlan) {
+      this.store.updateOpportunityStatus(opportunity.id, "rejected");
+      return;
+    }
+
+    const multiplierRaw = asNumber(profile?.params?.notionalMultiplier ?? null) ?? 1;
+    const multiplier = clamp(multiplierRaw, 0.2, 2.5);
+    const adjustedNotional = rawPlan.notionalUsd * multiplier;
+    const boundedNotional = Math.min(adjustedNotional, this.riskEngine.maxNotional(balance));
+    if (boundedNotional <= 0) {
+      this.store.updateOpportunityStatus(opportunity.id, "rejected");
+      return;
+    }
+
+    const plan = {
+      ...rawPlan,
+      notionalUsd: boundedNotional,
+      strategyId: rawPlan.strategyId || plugin.id,
+      metadata: {
+        ...rawPlan.metadata,
+        profileVariant: profile?.variant ?? "A",
+        profileNotionalMultiplier: multiplier,
+      },
+    };
+
+    const localRiskPolicy: RiskPolicy = { ...this.options.riskPolicy };
+    const overridePaper = asNumber(profile?.params?.minNetEdgeBpsPaper ?? null);
+    const overrideLive = asNumber(profile?.params?.minNetEdgeBpsLive ?? null);
+    if (overridePaper !== null) {
+      localRiskPolicy.minNetEdgeBpsPaper = clamp(overridePaper, 1, 500);
+    }
+    if (overrideLive !== null) {
+      localRiskPolicy.minNetEdgeBpsLive = clamp(overrideLive, 1, 700);
+    }
+
+    const simulation = this.simulator.estimate(plan, this.mode, localRiskPolicy);
+
+    this.store.insertSimulation({
+      opportunityId: opportunity.id,
+      mode: this.mode,
+      inputJson: JSON.stringify(plan),
+      resultJson: JSON.stringify(simulation),
+      createdAt: new Date().toISOString(),
+    });
+
+    this.store.updateOpportunityEstimate(
+      opportunity.id,
+      simulation.feeUsd,
+      simulation.netUsd,
+      simulation.pass ? "planned" : "rejected",
+    );
+
+    if (!simulation.pass) {
+      return;
+    }
+
+    await this.notifier.publish({
+      mode: this.mode,
+      level: "info",
+      event: "paper_passed",
+      pair: opportunity.pair,
+      netUsd: simulation.netUsd,
+      strategyId: plugin.id,
+    });
+
+    const effectiveMode = this.mode === "live" && this.evaluateLiveGate().passed ? "live" : "paper";
+    const trade = await this.executor.execute(effectiveMode, plan, simulation);
+
+    if (
+      effectiveMode === "live" &&
+      !trade.success &&
+      (trade.errorType === "permission_denied" || trade.errorType === "whitelist_restricted")
+    ) {
+      this.store.updateOpportunityStatus(opportunity.id, "degraded_to_paper");
+      this.store.insertAlert(
+        "warn",
+        "live_permission_degraded",
+        `degraded to paper: ${trade.errorType} ${trade.error ?? ""}`.trim(),
+      );
+      await this.notifier.publish({
+        mode: "live",
+        level: "warn",
+        event: "risk_alert",
+        pair: opportunity.pair,
+        strategyId: plugin.id,
+      });
+
+      const paperTrade = await this.executor.execute("paper", plan, simulation);
+      this.store.insertTrade(opportunity.id, "paper", paperTrade, new Date().toISOString());
+      await this.notifier.publish({
+        mode: "paper",
+        level: "info",
+        event: "trade_executed",
+        pair: opportunity.pair,
+        netUsd: paperTrade.netUsd,
+        txHash: paperTrade.txHash,
+        strategyId: plugin.id,
+      });
+      return;
+    }
+
+    this.store.insertTrade(opportunity.id, effectiveMode, trade, new Date().toISOString());
+
+    if (trade.success) {
+      this.consecutiveFailures = 0;
+      this.store.updateOpportunityStatus(opportunity.id, "executed");
+      await this.notifier.publish({
+        mode: effectiveMode,
+        level: "info",
+        event: "trade_executed",
+        pair: opportunity.pair,
+        netUsd: trade.netUsd,
+        txHash: trade.txHash,
+        strategyId: plugin.id,
+      });
+      return;
+    }
+
+    this.consecutiveFailures += 1;
+    this.store.updateOpportunityStatus(opportunity.id, "failed");
+    this.store.insertAlert("warn", "trade_failed", trade.error ?? "unknown error");
+    await this.notifier.publish({
+      mode: effectiveMode,
+      level: "error",
+      event: "risk_alert",
+      pair: opportunity.pair,
+      netUsd: trade.netUsd,
+      txHash: trade.txHash,
+      strategyId: plugin.id,
+    });
+
+    const dailyNet = this.store.getTodayNetUsd(effectiveMode);
+    const balanceNow = effectiveMode === "live" ? this.options.liveBalanceUsd : this.options.paperStartingBalanceUsd;
+    const breakDecision = this.riskEngine.shouldCircuitBreak(this.consecutiveFailures, dailyNet, balanceNow);
+    if (breakDecision.breakNow) {
+      this.mode = "paper";
+      this.circuitBreakerUntil = Date.now() + 5 * 60 * 1000;
+      this.store.insertAlert("error", "circuit_breaker", breakDecision.reasons.join("; "));
+      await this.notifier.publish({
+        mode: "paper",
+        level: "error",
+        event: "risk_alert",
+        pair: opportunity.pair,
+        strategyId: plugin.id,
+      });
+    }
+  }
+
+  private evaluateLiveGate(): { passed: boolean; reasons: string[] } {
+    const simulationStats = this.store.getSimulationStats(24);
+    const gateInput: GateCheck = {
+      simulationNetUsd24h: simulationStats.netUsd,
+      simulationWinRate24h: simulationStats.winRate,
+      consecutiveFailures: Math.max(this.consecutiveFailures, this.store.getRecentConsecutiveFailures(3)),
+      liveEnabled: this.options.liveEnabled,
+    };
+    return this.riskEngine.canPromoteToLive(gateInput);
+  }
+}
