@@ -137,19 +137,6 @@ export interface SkillManifest {
   strategyIds: string[];
 }
 
-export interface WhaleSignal {
-  id: string;
-  wallet: string;
-  token: string;
-  side: "buy" | "sell";
-  sizeUsd: number;
-  confidence: number;
-  sourceTxHash?: string;
-  status: "pending" | "processing" | "consumed" | "ignored";
-  receivedAt: string;
-  processedAt?: string;
-}
-
 export interface StrategyStatus {
   strategyId: string;
   opportunities: number;
@@ -166,6 +153,119 @@ export interface ShareCard {
   mode: ExecutionMode;
   netUsd: number;
   timestamp: string;
+}
+
+export interface GrowthMoment {
+  id: string;
+  category: "summary" | "trade" | "streak" | "safety";
+  title: string;
+  text: string;
+  timestamp: string;
+  valueUsd?: number;
+  tags: string[];
+}
+
+export type DiscoveryStrategyId = "spread-threshold" | "mean-reversion" | "volatility-breakout";
+export type DiscoverySessionStatus = "active" | "completed" | "stopped" | "failed";
+export type DiscoveryCandidateStatus = "pending" | "approved" | "executed" | "failed" | "rejected";
+
+export interface DiscoverySessionConfig {
+  strategyId: DiscoveryStrategyId;
+  pairs: string[];
+  durationMinutes: number;
+  sampleIntervalSec: number;
+  topN: number;
+  lookbackSamples: number;
+  zEnter: number;
+  volRatioMin: number;
+  minSpreadBps: number;
+  notionalUsd: number;
+}
+
+export interface DiscoverySessionSummary {
+  samples: number;
+  candidates: number;
+  topPair?: string;
+  topScore?: number;
+  status: DiscoverySessionStatus;
+}
+
+export interface DiscoverySession {
+  id: string;
+  strategyId: DiscoveryStrategyId;
+  status: DiscoverySessionStatus;
+  pairs: string[];
+  startedAt: string;
+  plannedEndAt: string;
+  endedAt?: string;
+  config: DiscoverySessionConfig;
+  summary?: DiscoverySessionSummary;
+}
+
+export interface DiscoverySample {
+  id: string;
+  sessionId: string;
+  pair: string;
+  ts: string;
+  dexAMid: number;
+  dexBMid: number;
+  spreadBps: number;
+  volatility: number | null;
+  zScore: number | null;
+  features: Record<string, unknown>;
+}
+
+export interface DiscoveryCandidate {
+  id: string;
+  sessionId: string;
+  strategyId: DiscoveryStrategyId;
+  pair: string;
+  buyDex: string;
+  sellDex: string;
+  signalTs: string;
+  score: number;
+  expectedNetBps: number;
+  expectedNetUsd: number;
+  confidence: number;
+  reason: string;
+  input: Record<string, unknown>;
+  status: DiscoveryCandidateStatus;
+  approvedAt?: string;
+  executedTradeId?: string;
+}
+
+export interface ChartPoint {
+  ts: string;
+  pair: string;
+  spreadBps: number;
+  volatility: number | null;
+  zScore: number | null;
+}
+
+export interface DiscoveryReport {
+  sessionId: string;
+  generatedAt: string;
+  summary: DiscoverySessionSummary & {
+    strategyId: DiscoveryStrategyId;
+    startedAt: string;
+    endedAt?: string;
+    pairs: string[];
+  };
+  topCandidates: DiscoveryCandidate[];
+  charts: Record<string, ChartPoint[]>;
+}
+
+export interface DiscoveryApproveResult {
+  approved: boolean;
+  sessionId: string;
+  candidateId: string;
+  mode: ExecutionMode;
+  effectiveMode: ExecutionMode;
+  opportunityId: string;
+  simulation: SimulationResult;
+  tradeResult: TradeResult;
+  degradedToPaper: boolean;
+  tradeId?: string;
 }
 
 export interface StrategyProfile {

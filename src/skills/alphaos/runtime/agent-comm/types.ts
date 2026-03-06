@@ -1,0 +1,322 @@
+import { z } from "zod";
+import type { DiscoveryStrategyId, ExecutionMode } from "../../types";
+
+type Assert<T extends true> = T;
+type IsEqual<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2)
+    ? (<T>() => T extends B ? 1 : 2) extends (<T>() => T extends A ? 1 : 2)
+      ? true
+      : false
+    : false;
+
+export const AGENT_COMM_ENVELOPE_VERSION = 1;
+export const AGENT_COMM_DEFAULT_MAX_MESSAGE_BYTES = 4096;
+
+export const agentCommandTypes = [
+  "ping",
+  "probe_onchainos",
+  "start_discovery",
+  "get_discovery_report",
+  "approve_candidate",
+  "request_mode_change",
+] as const;
+
+export const agentPeerStatuses = ["pending", "trusted", "blocked", "revoked"] as const;
+export const agentMessageDirections = ["inbound", "outbound"] as const;
+export const agentMessageStatuses = [
+  "pending",
+  "sent",
+  "confirmed",
+  "received",
+  "decrypted",
+  "executed",
+  "rejected",
+  "failed",
+] as const;
+export const agentMessageReceiptTypes = ["ack", "status", "execution", "error", "x402"] as const;
+export const commListenerModes = ["disabled", "poll", "ws"] as const;
+export const x402Modes = ["disabled", "observe", "enforce"] as const;
+
+const executionModes = ["paper", "live"] as const;
+const discoveryStrategyIds = [
+  "spread-threshold",
+  "mean-reversion",
+  "volatility-breakout",
+] as const;
+
+type _ExecutionModeMatches = Assert<
+  IsEqual<(typeof executionModes)[number], ExecutionMode>
+>;
+type _DiscoveryStrategyMatches = Assert<
+  IsEqual<(typeof discoveryStrategyIds)[number], DiscoveryStrategyId>
+>;
+
+export const jsonObjectSchema = z.record(z.string(), z.unknown());
+export const executionModeSchema = z.enum(executionModes);
+const discoveryStrategyIdSchema = z.enum(discoveryStrategyIds);
+
+export const agentCommandTypeSchema = z.enum(agentCommandTypes);
+export const agentPeerStatusSchema = z.enum(agentPeerStatuses);
+export const agentMessageDirectionSchema = z.enum(agentMessageDirections);
+export const agentMessageStatusSchema = z.enum(agentMessageStatuses);
+export const agentMessageReceiptTypeSchema = z.enum(agentMessageReceiptTypes);
+export const commListenerModeSchema = z.enum(commListenerModes);
+export const x402ModeSchema = z.enum(x402Modes);
+export const agentPeerCapabilitySchema = agentCommandTypeSchema;
+
+export const pingCommandPayloadSchema = z
+  .object({
+    echo: z.string().optional(),
+    note: z.string().optional(),
+  })
+  .strict();
+
+export const probeOnchainOsCommandPayloadSchema = z
+  .object({
+    pair: z.string().optional(),
+    chainIndex: z.string().optional(),
+    notionalUsd: z.number().finite().optional(),
+  })
+  .strict();
+
+export const startDiscoveryCommandPayloadSchema = z
+  .object({
+    strategyId: discoveryStrategyIdSchema.optional(),
+    pairs: z.array(z.string().min(1)).optional(),
+    durationMinutes: z.number().int().positive().optional(),
+    sampleIntervalSec: z.number().int().positive().optional(),
+    topN: z.number().int().positive().optional(),
+  })
+  .strict();
+
+export const getDiscoveryReportCommandPayloadSchema = z
+  .object({
+    sessionId: z.string().min(1),
+  })
+  .strict();
+
+export const approveCandidateCommandPayloadSchema = z
+  .object({
+    sessionId: z.string().min(1),
+    candidateId: z.string().min(1),
+    mode: executionModeSchema.optional(),
+  })
+  .strict();
+
+export const requestModeChangeCommandPayloadSchema = z
+  .object({
+    requestedMode: executionModeSchema,
+    reason: z.string().optional(),
+  })
+  .strict();
+
+export const agentCommandDescriptorSchema = z
+  .object({
+    type: agentCommandTypeSchema,
+    schemaVersion: z.number().int().positive(),
+  })
+  .strict();
+
+export const pingCommandSchema = z
+  .object({
+    type: z.literal("ping"),
+    payload: pingCommandPayloadSchema,
+  })
+  .strict();
+
+export const probeOnchainOsCommandSchema = z
+  .object({
+    type: z.literal("probe_onchainos"),
+    payload: probeOnchainOsCommandPayloadSchema,
+  })
+  .strict();
+
+export const startDiscoveryCommandSchema = z
+  .object({
+    type: z.literal("start_discovery"),
+    payload: startDiscoveryCommandPayloadSchema,
+  })
+  .strict();
+
+export const getDiscoveryReportCommandSchema = z
+  .object({
+    type: z.literal("get_discovery_report"),
+    payload: getDiscoveryReportCommandPayloadSchema,
+  })
+  .strict();
+
+export const approveCandidateCommandSchema = z
+  .object({
+    type: z.literal("approve_candidate"),
+    payload: approveCandidateCommandPayloadSchema,
+  })
+  .strict();
+
+export const requestModeChangeCommandSchema = z
+  .object({
+    type: z.literal("request_mode_change"),
+    payload: requestModeChangeCommandPayloadSchema,
+  })
+  .strict();
+
+export const agentCommandSchema = z.discriminatedUnion("type", [
+  pingCommandSchema,
+  probeOnchainOsCommandSchema,
+  startDiscoveryCommandSchema,
+  getDiscoveryReportCommandSchema,
+  approveCandidateCommandSchema,
+  requestModeChangeCommandSchema,
+]);
+
+export const x402ProofSchema = z
+  .object({
+    scheme: z.literal("x402"),
+    version: z.string().optional(),
+    network: z.string().optional(),
+    payer: z.string().optional(),
+    payee: z.string().optional(),
+    asset: z.string().optional(),
+    amount: z.string().optional(),
+    nonce: z.string().optional(),
+    expiresAt: z.string().optional(),
+    signature: z.string().optional(),
+    metadata: jsonObjectSchema.optional(),
+  })
+  .strict();
+
+export const encryptedEnvelopeSchema = z
+  .object({
+    version: z.literal(AGENT_COMM_ENVELOPE_VERSION),
+    senderPeerId: z.string().min(1),
+    senderPubkey: z.string().min(1),
+    recipient: z.string().min(1),
+    nonce: z.string().min(1),
+    timestamp: z.string().min(1),
+    command: agentCommandDescriptorSchema,
+    x402: x402ProofSchema.optional(),
+    ciphertext: z.string().min(1),
+    signature: z.string().min(1),
+  })
+  .strict();
+
+export const agentPeerSchema = z
+  .object({
+    peerId: z.string().min(1),
+    name: z.string().optional(),
+    walletAddress: z.string().min(1),
+    pubkey: z.string().min(1),
+    status: agentPeerStatusSchema,
+    capabilities: z.array(agentPeerCapabilitySchema),
+    metadata: jsonObjectSchema.optional(),
+    createdAt: z.string().min(1),
+    updatedAt: z.string().min(1),
+  })
+  .strict();
+
+export const agentMessageSchema = z
+  .object({
+    id: z.string().min(1),
+    direction: agentMessageDirectionSchema,
+    peerId: z.string().min(1),
+    txHash: z.string().optional(),
+    nonce: z.string().min(1),
+    commandType: agentCommandTypeSchema,
+    ciphertext: z.string().min(1),
+    status: agentMessageStatusSchema,
+    error: z.string().optional(),
+    sentAt: z.string().optional(),
+    receivedAt: z.string().optional(),
+    executedAt: z.string().optional(),
+    createdAt: z.string().min(1),
+    updatedAt: z.string().min(1),
+  })
+  .strict();
+
+export const agentMessageReceiptSchema = z
+  .object({
+    id: z.string().min(1),
+    messageId: z.string().min(1),
+    receiptType: agentMessageReceiptTypeSchema,
+    payload: jsonObjectSchema,
+    createdAt: z.string().min(1),
+  })
+  .strict();
+
+export const agentSessionSchema = z
+  .object({
+    id: z.string().min(1),
+    peerId: z.string().min(1),
+    sharedKeyHint: z.string().optional(),
+    lastNonce: z.string().optional(),
+    lastTxHash: z.string().optional(),
+    updatedAt: z.string().min(1),
+  })
+  .strict();
+
+export const listenerCursorSchema = z
+  .object({
+    address: z.string().min(1),
+    chainId: z.string().min(1),
+    cursor: z.string().min(1),
+    updatedAt: z.string().min(1),
+  })
+  .strict();
+
+export const x402ReceiptSchema = z
+  .object({
+    id: z.string().min(1),
+    messageId: z.string().min(1),
+    payer: z.string().min(1),
+    amount: z.string().min(1),
+    asset: z.string().min(1),
+    proof: x402ProofSchema,
+    verified: z.boolean(),
+    createdAt: z.string().min(1),
+  })
+  .strict();
+
+export const agentCommStatusSchema = z
+  .object({
+    enabled: z.boolean(),
+    chainId: z.number().int().positive(),
+    listenerMode: commListenerModeSchema,
+    walletAlias: z.string().min(1),
+    x402Mode: x402ModeSchema,
+    peerCount: z.number().int().nonnegative(),
+    pendingMessageCount: z.number().int().nonnegative(),
+    lastCursor: listenerCursorSchema.optional(),
+  })
+  .strict();
+
+export type AgentCommandType = z.infer<typeof agentCommandTypeSchema>;
+export type AgentPeerCapability = z.infer<typeof agentPeerCapabilitySchema>;
+export type AgentPeerStatus = z.infer<typeof agentPeerStatusSchema>;
+export type AgentMessageDirection = z.infer<typeof agentMessageDirectionSchema>;
+export type AgentMessageStatus = z.infer<typeof agentMessageStatusSchema>;
+export type AgentMessageReceiptType = z.infer<typeof agentMessageReceiptTypeSchema>;
+export type CommListenerMode = z.infer<typeof commListenerModeSchema>;
+export type X402Mode = z.infer<typeof x402ModeSchema>;
+
+export type PingCommandPayload = z.infer<typeof pingCommandPayloadSchema>;
+export type ProbeOnchainOsCommandPayload = z.infer<typeof probeOnchainOsCommandPayloadSchema>;
+export type StartDiscoveryCommandPayload = z.infer<typeof startDiscoveryCommandPayloadSchema>;
+export type GetDiscoveryReportCommandPayload = z.infer<typeof getDiscoveryReportCommandPayloadSchema>;
+export type ApproveCandidateCommandPayload = z.infer<typeof approveCandidateCommandPayloadSchema>;
+export type RequestModeChangeCommandPayload = z.infer<typeof requestModeChangeCommandPayloadSchema>;
+export type AgentCommandDescriptor = z.infer<typeof agentCommandDescriptorSchema>;
+export type PingCommand = z.infer<typeof pingCommandSchema>;
+export type ProbeOnchainOsCommand = z.infer<typeof probeOnchainOsCommandSchema>;
+export type StartDiscoveryCommand = z.infer<typeof startDiscoveryCommandSchema>;
+export type GetDiscoveryReportCommand = z.infer<typeof getDiscoveryReportCommandSchema>;
+export type ApproveCandidateCommand = z.infer<typeof approveCandidateCommandSchema>;
+export type RequestModeChangeCommand = z.infer<typeof requestModeChangeCommandSchema>;
+export type AgentCommand = z.infer<typeof agentCommandSchema>;
+export type X402Proof = z.infer<typeof x402ProofSchema>;
+export type EncryptedEnvelope = z.infer<typeof encryptedEnvelopeSchema>;
+export type AgentPeer = z.infer<typeof agentPeerSchema>;
+export type AgentMessage = z.infer<typeof agentMessageSchema>;
+export type AgentMessageReceipt = z.infer<typeof agentMessageReceiptSchema>;
+export type AgentSession = z.infer<typeof agentSessionSchema>;
+export type ListenerCursor = z.infer<typeof listenerCursorSchema>;
+export type X402Receipt = z.infer<typeof x402ReceiptSchema>;
+export type AgentCommStatus = z.infer<typeof agentCommStatusSchema>;

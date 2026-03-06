@@ -73,4 +73,59 @@ describe("loadConfig security defaults", () => {
     expect(config.opportunityDedupTtlMs).toBe(12000);
     expect(config.opportunityDedupMinEdgeDeltaBps).toBe(3.5);
   });
+
+  it("uses discovery defaults when env is unset", () => {
+    delete process.env.DISCOVERY_DEFAULT_DURATION_MINUTES;
+    delete process.env.DISCOVERY_DEFAULT_SAMPLE_INTERVAL_SEC;
+    delete process.env.DISCOVERY_DEFAULT_TOPN;
+    delete process.env.DISCOVERY_LOOKBACK_SAMPLES;
+    delete process.env.DISCOVERY_Z_ENTER;
+    delete process.env.DISCOVERY_VOL_RATIO_MIN;
+    delete process.env.DISCOVERY_MIN_SPREAD_BPS;
+    delete process.env.DISCOVERY_NOTIONAL_USD;
+
+    const config = loadConfig();
+    expect(config.discoveryDefaultDurationMinutes).toBe(30);
+    expect(config.discoveryDefaultSampleIntervalSec).toBe(60);
+    expect(config.discoveryDefaultTopN).toBe(10);
+    expect(config.discoveryLookbackSamples).toBe(100);
+    expect(config.discoveryZEnter).toBe(2);
+    expect(config.discoveryVolRatioMin).toBe(0.5);
+    expect(config.discoveryMinSpreadBps).toBe(20);
+    expect(config.discoveryNotionalUsd).toBe(1000);
+  });
+
+  it("reads discovery configuration from env", () => {
+    process.env.DISCOVERY_DEFAULT_DURATION_MINUTES = "45";
+    process.env.DISCOVERY_DEFAULT_SAMPLE_INTERVAL_SEC = "15";
+    process.env.DISCOVERY_DEFAULT_TOPN = "25";
+    process.env.DISCOVERY_LOOKBACK_SAMPLES = "180";
+    process.env.DISCOVERY_Z_ENTER = "1.8";
+    process.env.DISCOVERY_VOL_RATIO_MIN = "0.7";
+    process.env.DISCOVERY_MIN_SPREAD_BPS = "12";
+    process.env.DISCOVERY_NOTIONAL_USD = "2500";
+
+    const config = loadConfig();
+    expect(config.discoveryDefaultDurationMinutes).toBe(45);
+    expect(config.discoveryDefaultSampleIntervalSec).toBe(15);
+    expect(config.discoveryDefaultTopN).toBe(25);
+    expect(config.discoveryLookbackSamples).toBe(180);
+    expect(config.discoveryZEnter).toBe(1.8);
+    expect(config.discoveryVolRatioMin).toBe(0.7);
+    expect(config.discoveryMinSpreadBps).toBe(12);
+    expect(config.discoveryNotionalUsd).toBe(2500);
+  });
+
+  it("rejects COMM_ENABLED without COMM_RPC_URL", () => {
+    process.env.COMM_ENABLED = "true";
+    delete process.env.COMM_RPC_URL;
+
+    expect(() => loadConfig()).toThrow("COMM_ENABLED=true requires COMM_RPC_URL");
+  });
+
+  it("rejects unsupported COMM_LISTENER_MODE=ws", () => {
+    process.env.COMM_LISTENER_MODE = "ws";
+
+    expect(() => loadConfig()).toThrow("COMM_LISTENER_MODE=ws is not supported in agent-comm v0.1");
+  });
 });

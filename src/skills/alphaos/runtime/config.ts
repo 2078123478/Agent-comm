@@ -1,5 +1,7 @@
 import dotenv from "dotenv";
+import { z } from "zod";
 import type { ExecutionMode, RiskPolicy } from "../types";
+import { commListenerModeSchema, x402ModeSchema } from "./agent-comm/types";
 
 dotenv.config();
 
@@ -66,6 +68,22 @@ function readAuthMode(name: string, fallback: OnchainAuthMode): OnchainAuthMode 
   return fallback;
 }
 
+function readCommListenerMode(name: string, fallback: z.infer<typeof commListenerModeSchema>) {
+  const raw = process.env[name];
+  if (!raw) {
+    return fallback;
+  }
+  return commListenerModeSchema.parse(raw);
+}
+
+function readX402Mode(name: string, fallback: z.infer<typeof x402ModeSchema>) {
+  const raw = process.env[name];
+  if (!raw) {
+    return fallback;
+  }
+  return x402ModeSchema.parse(raw);
+}
+
 export interface AlphaOsConfig {
   port: number;
   logLevel: string;
@@ -115,10 +133,147 @@ export interface AlphaOsConfig {
   opportunityDedupMinEdgeDeltaBps: number;
   riskPolicy: RiskPolicy;
   strategyProfileDefaults: Record<string, unknown>;
+  discoveryDefaultDurationMinutes: number;
+  discoveryDefaultSampleIntervalSec: number;
+  discoveryDefaultTopN: number;
+  discoveryLookbackSamples: number;
+  discoveryZEnter: number;
+  discoveryVolRatioMin: number;
+  discoveryMinSpreadBps: number;
+  discoveryNotionalUsd: number;
+  commEnabled: boolean;
+  commChainId: number;
+  commRpcUrl?: string;
+  commListenerMode: z.infer<typeof commListenerModeSchema>;
+  commPollIntervalMs: number;
+  commWalletAlias: string;
+  commPaymasterUrl?: string;
+  x402Mode: z.infer<typeof x402ModeSchema>;
+}
+
+type AgentCommConfig = Pick<
+  AlphaOsConfig,
+  | "commEnabled"
+  | "commChainId"
+  | "commRpcUrl"
+  | "commListenerMode"
+  | "commPollIntervalMs"
+  | "commWalletAlias"
+  | "commPaymasterUrl"
+>;
+
+const executionModeSchema: z.ZodType<ExecutionMode> = z.enum(["paper", "live"]);
+const onchainAuthModeSchema: z.ZodType<OnchainAuthMode> = z.enum(["bearer", "api-key", "hmac"]);
+const riskPolicySchema: z.ZodType<RiskPolicy> = z
+  .object({
+    minNetEdgeBpsPaper: z.number().finite(),
+    minNetEdgeBpsLive: z.number().finite(),
+    maxTradePctBalance: z.number().finite(),
+    maxDailyLossPct: z.number().finite(),
+    maxConsecutiveFailures: z.number().finite(),
+  })
+  .strict();
+
+export const alphaOsConfigSchema: z.ZodType<AlphaOsConfig> = z
+  .object({
+    port: z.number().int().nonnegative(),
+    logLevel: z.string(),
+    apiSecret: z.string().optional(),
+    demoPublic: z.boolean(),
+    engineIntervalMs: z.number().finite(),
+    pair: z.string(),
+    dexes: z.tuple([z.string(), z.string()]),
+    startMode: executionModeSchema,
+    liveEnabled: z.boolean(),
+    paperStartingBalanceUsd: z.number().finite(),
+    liveBalanceUsd: z.number().finite(),
+    onchainOsApiBase: z.string().optional(),
+    onchainOsApiKey: z.string().optional(),
+    onchainOsApiSecret: z.string().optional(),
+    onchainOsPassphrase: z.string().optional(),
+    onchainOsProjectId: z.string().optional(),
+    onchainAuthMode: onchainAuthModeSchema,
+    onchainApiKeyHeader: z.string(),
+    onchainChainIndex: z.string(),
+    onchainRequireSimulate: z.boolean(),
+    onchainEnableCompatFallback: z.boolean(),
+    onchainTokenCacheTtlSeconds: z.number().finite(),
+    onchainTokenProfilePath: z.string(),
+    onchainPrivateRpcUrl: z.string().optional(),
+    onchainRelayUrl: z.string().optional(),
+    onchainUsePrivateSubmit: z.boolean(),
+    openClawHookUrl: z.string().optional(),
+    openClawHookToken: z.string().optional(),
+    dataDir: z.string(),
+    enabledStrategies: z.array(z.string()),
+    mirrorMinConfidence: z.number().finite(),
+    slippageBps: z.number().finite(),
+    takerFeeBps: z.number().finite(),
+    gasUsdDefault: z.number().finite(),
+    mevPenaltyBps: z.number().finite(),
+    liquidityUsdDefault: z.number().finite(),
+    volatilityDefault: z.number().finite(),
+    avgLatencyMsDefault: z.number().finite(),
+    evalNotionalUsdDefault: z.number().finite(),
+    autoPromoteToLive: z.boolean(),
+    wsEnabled: z.boolean(),
+    wsUrl: z.string(),
+    wsReconnectMs: z.number().finite(),
+    quoteStaleMs: z.number().finite(),
+    opportunityDedupTtlMs: z.number().finite(),
+    opportunityDedupMinEdgeDeltaBps: z.number().finite(),
+    riskPolicy: riskPolicySchema,
+    strategyProfileDefaults: z.record(z.string(), z.unknown()),
+    discoveryDefaultDurationMinutes: z.number().finite(),
+    discoveryDefaultSampleIntervalSec: z.number().finite(),
+    discoveryDefaultTopN: z.number().finite(),
+    discoveryLookbackSamples: z.number().finite(),
+    discoveryZEnter: z.number().finite(),
+    discoveryVolRatioMin: z.number().finite(),
+    discoveryMinSpreadBps: z.number().finite(),
+    discoveryNotionalUsd: z.number().finite(),
+    commEnabled: z.boolean(),
+    commChainId: z.number().int().positive(),
+    commRpcUrl: z.string().optional(),
+    commListenerMode: commListenerModeSchema,
+    commPollIntervalMs: z.number().finite(),
+    commWalletAlias: z.string().min(1),
+    commPaymasterUrl: z.string().optional(),
+    x402Mode: x402ModeSchema,
+  })
+  .strict();
+
+function readAgentCommConfig(): AgentCommConfig {
+  return {
+    commEnabled: readBoolean("COMM_ENABLED", false),
+    commChainId: readNumber("COMM_CHAIN_ID", readNumber("ONCHAINOS_CHAIN_INDEX", 196)),
+    commRpcUrl: process.env.COMM_RPC_URL,
+    commListenerMode: readCommListenerMode("COMM_LISTENER_MODE", "disabled"),
+    commPollIntervalMs: readNumber("COMM_POLL_INTERVAL_MS", 5000),
+    commWalletAlias: process.env.COMM_WALLET_ALIAS ?? "agent-comm",
+    commPaymasterUrl: process.env.COMM_PAYMASTER_URL,
+  };
+}
+
+function assertSupportedCommListenerMode(mode: AgentCommConfig["commListenerMode"]): void {
+  if (mode === "ws") {
+    throw new Error("COMM_LISTENER_MODE=ws is not supported in agent-comm v0.1 (use disabled|poll)");
+  }
+}
+
+function assertEnabledCommHasRpcUrl(config: Pick<AgentCommConfig, "commEnabled" | "commRpcUrl">): void {
+  if (config.commEnabled && !config.commRpcUrl?.trim()) {
+    throw new Error("COMM_ENABLED=true requires COMM_RPC_URL");
+  }
+}
+
+function assertAgentCommConfig(config: AgentCommConfig): void {
+  assertSupportedCommListenerMode(config.commListenerMode);
+  assertEnabledCommHasRpcUrl(config);
 }
 
 export function loadConfig(): AlphaOsConfig {
-  return {
+  const config = {
     port: readNumber("PORT", 3000),
     logLevel: process.env.LOG_LEVEL ?? "info",
     apiSecret: process.env.API_SECRET,
@@ -177,5 +332,20 @@ export function loadConfig(): AlphaOsConfig {
       "dex-arbitrage": { variant: "A", notionalMultiplier: 1 },
       "smart-money-mirror": { variant: "A", notionalMultiplier: 1 },
     }),
+    discoveryDefaultDurationMinutes: readNumber("DISCOVERY_DEFAULT_DURATION_MINUTES", 30),
+    discoveryDefaultSampleIntervalSec: readNumber("DISCOVERY_DEFAULT_SAMPLE_INTERVAL_SEC", 60),
+    discoveryDefaultTopN: readNumber("DISCOVERY_DEFAULT_TOPN", 10),
+    discoveryLookbackSamples: readNumber("DISCOVERY_LOOKBACK_SAMPLES", 100),
+    discoveryZEnter: readNumber("DISCOVERY_Z_ENTER", 2.0),
+    discoveryVolRatioMin: readNumber("DISCOVERY_VOL_RATIO_MIN", 0.5),
+    discoveryMinSpreadBps: readNumber("DISCOVERY_MIN_SPREAD_BPS", 20),
+    discoveryNotionalUsd: readNumber("DISCOVERY_NOTIONAL_USD", 1000),
+    ...readAgentCommConfig(),
+    x402Mode: readX402Mode("X402_MODE", "disabled"),
   };
+  const parsed = alphaOsConfigSchema.parse(config);
+
+  assertAgentCommConfig(parsed);
+
+  return parsed;
 }

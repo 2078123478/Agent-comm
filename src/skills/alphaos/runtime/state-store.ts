@@ -2,9 +2,20 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import Database from "better-sqlite3";
+import { z } from "zod";
 import type {
   BacktestSnapshotRow,
+  DiscoveryCandidate,
+  DiscoveryCandidateStatus,
+  DiscoveryReport,
+  DiscoverySample,
+  DiscoverySession,
+  DiscoverySessionConfig,
+  DiscoverySessionStatus,
+  DiscoverySessionSummary,
+  DiscoveryStrategyId,
   ExecutionMode,
+  GrowthMoment,
   Opportunity,
   ShareCard,
   StrategyProfile,
@@ -12,8 +23,23 @@ import type {
   TokenCacheEntry,
   TodayMetrics,
   TradeResult,
-  WhaleSignal,
 } from "../types";
+import {
+  agentMessageSchema,
+  agentPeerCapabilitySchema,
+  agentPeerSchema,
+  jsonObjectSchema,
+} from "./agent-comm/types";
+import type {
+  AgentCommandType,
+  AgentMessage,
+  AgentMessageDirection,
+  AgentMessageStatus,
+  AgentPeer,
+  AgentPeerCapability,
+  AgentPeerStatus,
+  ListenerCursor,
+} from "./agent-comm/types";
 import { utcDay } from "./time";
 
 export interface HookOutboxRow {
@@ -33,6 +59,42 @@ interface SimulationRecord {
   createdAt: string;
 }
 
+interface AgentPeerRow {
+  peerId: string;
+  name: string | null;
+  walletAddress: string;
+  pubkey: string;
+  status: AgentPeerStatus;
+  capabilitiesJson: string;
+  metadataJson: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface AgentMessageRow {
+  id: string;
+  direction: AgentMessageDirection;
+  peerId: string;
+  txHash: string | null;
+  nonce: string;
+  commandType: AgentCommandType;
+  ciphertext: string;
+  status: AgentMessageStatus;
+  error: string | null;
+  sentAt: string | null;
+  receivedAt: string | null;
+  executedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface ListenerCursorRow {
+  address: string;
+  chainId: string;
+  cursor: string;
+  updatedAt: string;
+}
+
 function quantile(values: number[], q: number): number | null {
   if (values.length === 0) {
     return null;
@@ -50,8 +112,53 @@ function quantile(values: number[], q: number): number | null {
   return lowerValue + (upperValue - lowerValue) * weight;
 }
 
+function formatSignedUsd(value: number): string {
+  return value >= 0 ? `+${value.toFixed(2)}` : value.toFixed(2);
+}
+
 function createDb(filePath: string): Database.Database {
   return new Database(filePath);
+}
+
+function formatAgentCommRowContext(entity: string, field: string, primaryKey: string): string {
+  return `invalid agent-comm ${entity}.${field} for ${primaryKey}`;
+}
+
+const agentPeerSelectSql = `SELECT peer_id AS peerId,
+                                   name,
+                                   wallet_address AS walletAddress,
+                                   pubkey,
+                                   status,
+                                   capabilities_json AS capabilitiesJson,
+                                   metadata_json AS metadataJson,
+                                   created_at AS createdAt,
+                                   updated_at AS updatedAt
+                            FROM agent_peers`;
+
+const agentMessageSelectSql = `SELECT id,
+                                      direction,
+                                      peer_id AS peerId,
+                                      tx_hash AS txHash,
+                                      nonce,
+                                      command_type AS commandType,
+                                      ciphertext,
+                                      status,
+                                      error,
+                                      sent_at AS sentAt,
+                                      received_at AS receivedAt,
+                                      executed_at AS executedAt,
+                                      created_at AS createdAt,
+                                      updated_at AS updatedAt
+                               FROM agent_messages`;
+
+const listenerCursorSelectSql = `SELECT address,
+                                        chain_id AS chainId,
+                                        cursor,
+                                        updated_at AS updatedAt
+                                 FROM listener_cursors`;
+
+function normalizeAgentCommLimit(limit: number): number {
+  return Math.max(1, Math.min(1000, Math.floor(limit)));
 }
 
 export class StateStore {
@@ -169,19 +276,6 @@ export class StateStore {
         created_at TEXT NOT NULL
       );
 
-      CREATE TABLE IF NOT EXISTS whale_signals (
-        id TEXT PRIMARY KEY,
-        wallet TEXT NOT NULL,
-        token TEXT NOT NULL,
-        side TEXT NOT NULL,
-        size_usd REAL NOT NULL,
-        confidence REAL NOT NULL,
-        source_tx_hash TEXT,
-        status TEXT NOT NULL,
-        received_at TEXT NOT NULL,
-        processed_at TEXT
-      );
-
       CREATE TABLE IF NOT EXISTS strategy_profiles (
         strategy_id TEXT PRIMARY KEY,
         variant TEXT NOT NULL,
@@ -205,6 +299,94 @@ export class StateStore {
         updated_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS discovery_sessions (
+        id TEXT PRIMARY KEY,
+        strategy_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        pairs_json TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        planned_end_at TEXT NOT NULL,
+        ended_at TEXT,
+        config_json TEXT NOT NULL,
+        summary_json TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS discovery_samples (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        pair TEXT NOT NULL,
+        ts TEXT NOT NULL,
+        dex_a_mid REAL NOT NULL,
+        dex_b_mid REAL NOT NULL,
+        spread_bps REAL NOT NULL,
+        volatility REAL,
+        z_score REAL,
+        features_json TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS discovery_candidates (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        strategy_id TEXT NOT NULL,
+        pair TEXT NOT NULL,
+        buy_dex TEXT NOT NULL,
+        sell_dex TEXT NOT NULL,
+        signal_ts TEXT NOT NULL,
+        score REAL NOT NULL,
+        expected_net_bps REAL NOT NULL,
+        expected_net_usd REAL NOT NULL,
+        confidence REAL NOT NULL,
+        reason TEXT NOT NULL,
+        input_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        approved_at TEXT,
+        executed_trade_id TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS discovery_reports (
+        session_id TEXT PRIMARY KEY,
+        report_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS agent_peers (
+        peer_id TEXT PRIMARY KEY,
+        name TEXT,
+        wallet_address TEXT NOT NULL UNIQUE,
+        pubkey TEXT NOT NULL,
+        status TEXT NOT NULL,
+        capabilities_json TEXT NOT NULL,
+        metadata_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS agent_messages (
+        id TEXT PRIMARY KEY,
+        direction TEXT NOT NULL,
+        peer_id TEXT NOT NULL,
+        tx_hash TEXT,
+        nonce TEXT NOT NULL,
+        command_type TEXT NOT NULL,
+        ciphertext TEXT NOT NULL,
+        status TEXT NOT NULL,
+        sent_at TEXT,
+        received_at TEXT,
+        executed_at TEXT,
+        error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(peer_id, direction, nonce)
+      );
+
+      CREATE TABLE IF NOT EXISTS listener_cursors (
+        address TEXT NOT NULL,
+        chain_id TEXT NOT NULL,
+        cursor TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(address, chain_id)
+      );
+
       CREATE INDEX IF NOT EXISTS idx_opportunities_status_detected_at
       ON opportunities(status, detected_at DESC);
 
@@ -217,12 +399,33 @@ export class StateStore {
       CREATE INDEX IF NOT EXISTS idx_hook_outbox_status_next_retry
       ON hook_outbox(status, next_retry_at);
 
-      CREATE INDEX IF NOT EXISTS idx_whale_signals_status_received
-      ON whale_signals(status, received_at DESC);
-
       CREATE INDEX IF NOT EXISTS idx_token_cache_expires
       ON token_cache(expires_at);
+
+      CREATE INDEX IF NOT EXISTS idx_discovery_sessions_status_started_at
+      ON discovery_sessions(status, started_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_discovery_samples_session_pair_ts
+      ON discovery_samples(session_id, pair, ts DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_discovery_candidates_session_score
+      ON discovery_candidates(session_id, score DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_discovery_candidates_status
+      ON discovery_candidates(status, signal_ts DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_agent_peers_status_updated_at
+      ON agent_peers(status, updated_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_agent_messages_peer_status_created_at
+      ON agent_messages(peer_id, status, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_agent_messages_tx_hash
+      ON agent_messages(tx_hash);
     `);
+
+    this.dropObsoletePhase2AgentCommTables(this.alphaDb);
+    this.ensureAgentMessagesUniqueNonce(this.alphaDb);
 
     this.ensureColumn(this.alphaDb, "opportunities", "metadata_json", "TEXT");
     this.ensureColumn(this.alphaDb, "trades", "error_type", "TEXT");
@@ -251,8 +454,206 @@ export class StateStore {
     }
   }
 
+  private dropObsoletePhase2AgentCommTables(db: Database.Database): void {
+    db.exec(`
+      DROP TABLE IF EXISTS agent_message_receipts;
+      DROP TABLE IF EXISTS agent_sessions;
+      DROP TABLE IF EXISTS x402_receipts;
+    `);
+  }
+
+  private ensureAgentMessagesUniqueNonce(db: Database.Database): void {
+    const row = db
+      .prepare(
+        `SELECT sql
+         FROM sqlite_master
+         WHERE type = 'table' AND name = 'agent_messages'`,
+      )
+      .get() as { sql: string | null } | undefined;
+
+    const normalizedSql = row?.sql?.replace(/\s+/g, "").toUpperCase() ?? "";
+    if (normalizedSql.includes("UNIQUE(PEER_ID,DIRECTION,NONCE)")) {
+      return;
+    }
+
+    try {
+      db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_messages_peer_direction_nonce
+        ON agent_messages(peer_id, direction, nonce);
+      `);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `failed to enforce agent_messages uniqueness on (peer_id, direction, nonce): ${reason}`,
+      );
+    }
+  }
+
   private runPreparedStatement(db: Database.Database, sql: string, ...params: unknown[]): void {
     db.prepare(sql).run(...params);
+  }
+
+  private toDiscoverySession(row: {
+    id: string;
+    strategyId: DiscoveryStrategyId;
+    status: DiscoverySessionStatus;
+    pairsJson: string;
+    startedAt: string;
+    plannedEndAt: string;
+    endedAt: string | null;
+    configJson: string;
+    summaryJson: string | null;
+  }): DiscoverySession {
+    return {
+      id: row.id,
+      strategyId: row.strategyId,
+      status: row.status,
+      pairs: JSON.parse(row.pairsJson) as string[],
+      startedAt: row.startedAt,
+      plannedEndAt: row.plannedEndAt,
+      endedAt: row.endedAt ?? undefined,
+      config: JSON.parse(row.configJson) as DiscoverySessionConfig,
+      summary: row.summaryJson ? (JSON.parse(row.summaryJson) as DiscoverySessionSummary) : undefined,
+    };
+  }
+
+  private toDiscoveryCandidate(row: {
+    id: string;
+    sessionId: string;
+    strategyId: DiscoveryStrategyId;
+    pair: string;
+    buyDex: string;
+    sellDex: string;
+    signalTs: string;
+    score: number;
+    expectedNetBps: number;
+    expectedNetUsd: number;
+    confidence: number;
+    reason: string;
+    inputJson: string;
+    status: DiscoveryCandidateStatus;
+    approvedAt: string | null;
+    executedTradeId: string | null;
+  }): DiscoveryCandidate {
+    return {
+      id: row.id,
+      sessionId: row.sessionId,
+      strategyId: row.strategyId,
+      pair: row.pair,
+      buyDex: row.buyDex,
+      sellDex: row.sellDex,
+      signalTs: row.signalTs,
+      score: row.score,
+      expectedNetBps: row.expectedNetBps,
+      expectedNetUsd: row.expectedNetUsd,
+      confidence: row.confidence,
+      reason: row.reason,
+      input: JSON.parse(row.inputJson) as Record<string, unknown>,
+      status: row.status,
+      approvedAt: row.approvedAt ?? undefined,
+      executedTradeId: row.executedTradeId ?? undefined,
+    };
+  }
+
+  private toAgentPeer(row: AgentPeerRow): AgentPeer {
+    const primaryKey = `peerId=${row.peerId}`;
+    return this.parseAgentCommEntity(agentPeerSchema, "agent peer", primaryKey, {
+      peerId: row.peerId,
+      name: row.name ?? undefined,
+      walletAddress: row.walletAddress,
+      pubkey: row.pubkey,
+      status: row.status,
+      capabilities: this.parseAgentCommJsonField(
+        agentPeerCapabilitySchema.array(),
+        "agent peer",
+        "capabilitiesJson",
+        primaryKey,
+        row.capabilitiesJson,
+      ),
+      metadata: row.metadataJson
+        ? this.parseAgentCommJsonField(
+            jsonObjectSchema,
+            "agent peer",
+            "metadataJson",
+            primaryKey,
+            row.metadataJson,
+          )
+        : undefined,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+    });
+  }
+
+  private toAgentMessage(row: AgentMessageRow): AgentMessage {
+    const primaryKey = `id=${row.id}`;
+    return this.parseAgentCommEntity(agentMessageSchema, "agent message", primaryKey, {
+      id: row.id,
+      direction: row.direction,
+      peerId: row.peerId,
+      txHash: row.txHash ?? undefined,
+      nonce: row.nonce,
+      commandType: row.commandType,
+      ciphertext: row.ciphertext,
+      status: row.status,
+      error: row.error ?? undefined,
+      sentAt: row.sentAt ?? undefined,
+      receivedAt: row.receivedAt ?? undefined,
+      executedAt: row.executedAt ?? undefined,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+    });
+  }
+
+  private toListenerCursor(row: ListenerCursorRow): ListenerCursor {
+    return {
+      address: row.address,
+      chainId: row.chainId,
+      cursor: row.cursor,
+      updatedAt: row.updatedAt,
+    };
+  }
+
+  private parseAgentCommEntity<T>(
+    schema: z.ZodType<T>,
+    entity: string,
+    primaryKey: string,
+    value: unknown,
+  ): T {
+    try {
+      return schema.parse(value);
+    } catch (error) {
+      throw this.wrapAgentCommRowError(entity, "row", primaryKey, error);
+    }
+  }
+
+  private parseAgentCommJsonField<T>(
+    schema: z.ZodType<T>,
+    entity: string,
+    field: string,
+    primaryKey: string,
+    raw: string,
+  ): T {
+    try {
+      return schema.parse(JSON.parse(raw));
+    } catch (error) {
+      throw this.wrapAgentCommRowError(entity, field, primaryKey, error);
+    }
+  }
+
+  private wrapAgentCommRowError(
+    entity: string,
+    field: string,
+    primaryKey: string,
+    error: unknown,
+  ): Error {
+    const context = formatAgentCommRowContext(entity, field, primaryKey);
+    if (error instanceof z.ZodError) {
+      return new Error(`${context}: ${error.issues.map((issue) => issue.message).join("; ")}`);
+    }
+    if (error instanceof Error) {
+      return new Error(`${context}: ${error.message}`);
+    }
+    return new Error(`${context}: ${String(error)}`);
   }
 
   upsertStrategy(pluginId: string, config: unknown): string {
@@ -455,6 +856,700 @@ export class StateStore {
       .all(safeLimit) as TokenCacheEntry[];
   }
 
+  upsertAgentPeer(input: {
+    peerId: string;
+    walletAddress: string;
+    pubkey: string;
+    name?: string;
+    status?: AgentPeerStatus;
+    capabilities?: AgentPeerCapability[];
+    metadata?: Record<string, unknown>;
+  }): AgentPeer {
+    const now = new Date().toISOString();
+    this.runPreparedStatement(
+      this.alphaDb,
+      `INSERT INTO agent_peers (
+        peer_id, name, wallet_address, pubkey, status, capabilities_json, metadata_json, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(peer_id) DO UPDATE SET
+        name = excluded.name,
+        wallet_address = excluded.wallet_address,
+        pubkey = excluded.pubkey,
+        status = excluded.status,
+        capabilities_json = excluded.capabilities_json,
+        metadata_json = excluded.metadata_json,
+        updated_at = excluded.updated_at`,
+      input.peerId,
+      input.name ?? null,
+      input.walletAddress,
+      input.pubkey,
+      input.status ?? "pending",
+      JSON.stringify(input.capabilities ?? []),
+      input.metadata ? JSON.stringify(input.metadata) : null,
+      now,
+      now,
+    );
+
+    return this.getRequiredAgentPeer(
+      input.peerId,
+      `agent peer not found after upsert: ${input.peerId}`,
+    );
+  }
+
+  getAgentPeer(peerId: string): AgentPeer | null {
+    return this.getSingleAgentPeer("WHERE peer_id = ?", peerId);
+  }
+
+  getAgentPeerByWalletAddress(walletAddress: string): AgentPeer | null {
+    return this.getSingleAgentPeer("WHERE wallet_address = ?", walletAddress);
+  }
+
+  private getSingleAgentPeer(whereClause: string, ...params: unknown[]): AgentPeer | null {
+    const row = this.alphaDb
+      .prepare(`${agentPeerSelectSql} ${whereClause} LIMIT 1`)
+      .get(...params) as AgentPeerRow | undefined;
+    return row ? this.toAgentPeer(row) : null;
+  }
+
+  private getRequiredAgentPeer(peerId: string, errorMessage: string): AgentPeer {
+    const peer = this.getAgentPeer(peerId);
+    if (!peer) {
+      throw new Error(errorMessage);
+    }
+    return peer;
+  }
+
+  listAgentPeers(limit = 100, status?: AgentPeerStatus): AgentPeer[] {
+    const safeLimit = normalizeAgentCommLimit(limit);
+    const query = status
+      ? `${agentPeerSelectSql} WHERE status = ? ORDER BY updated_at DESC LIMIT ?`
+      : `${agentPeerSelectSql} ORDER BY updated_at DESC LIMIT ?`;
+    const rows = (status
+      ? this.alphaDb.prepare(query).all(status, safeLimit)
+      : this.alphaDb.prepare(query).all(safeLimit)) as AgentPeerRow[];
+    return rows.map((row) => this.toAgentPeer(row));
+  }
+
+  insertAgentMessage(input: {
+    id?: string;
+    direction: AgentMessageDirection;
+    peerId: string;
+    txHash?: string;
+    nonce: string;
+    commandType: AgentCommandType;
+    ciphertext: string;
+    status?: AgentMessageStatus;
+    sentAt?: string;
+    receivedAt?: string;
+    executedAt?: string;
+    error?: string;
+  }): AgentMessage {
+    const id = input.id ?? crypto.randomUUID();
+    const now = new Date().toISOString();
+    this.runPreparedStatement(
+      this.alphaDb,
+      `INSERT INTO agent_messages (
+        id, direction, peer_id, tx_hash, nonce, command_type, ciphertext, status,
+        sent_at, received_at, executed_at, error, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      id,
+      input.direction,
+      input.peerId,
+      input.txHash ?? null,
+      input.nonce,
+      input.commandType,
+      input.ciphertext,
+      input.status ?? "pending",
+      input.sentAt ?? null,
+      input.receivedAt ?? null,
+      input.executedAt ?? null,
+      input.error ?? null,
+      now,
+      now,
+    );
+
+    return this.getRequiredAgentMessage(id, `agent message not found after insert: ${id}`);
+  }
+
+  getAgentMessage(id: string): AgentMessage | null {
+    return this.getSingleAgentMessage("WHERE id = ?", id);
+  }
+
+  findAgentMessage(
+    peerId: string,
+    direction: AgentMessageDirection,
+    nonce: string,
+  ): AgentMessage | null {
+    return this.getSingleAgentMessage(
+      "WHERE peer_id = ? AND direction = ? AND nonce = ?",
+      peerId,
+      direction,
+      nonce,
+    );
+  }
+
+  private getSingleAgentMessage(whereClause: string, ...params: unknown[]): AgentMessage | null {
+    const row = this.alphaDb
+      .prepare(`${agentMessageSelectSql} ${whereClause} LIMIT 1`)
+      .get(...params) as AgentMessageRow | undefined;
+    return row ? this.toAgentMessage(row) : null;
+  }
+
+  private getRequiredAgentMessage(id: string, errorMessage: string): AgentMessage {
+    const message = this.getAgentMessage(id);
+    if (!message) {
+      throw new Error(errorMessage);
+    }
+    return message;
+  }
+
+  listAgentMessages(
+    limit = 50,
+    filters?: {
+      peerId?: string;
+      direction?: AgentMessageDirection;
+      status?: AgentMessageStatus;
+    },
+  ): AgentMessage[] {
+    const safeLimit = normalizeAgentCommLimit(limit);
+    const clauses: string[] = [];
+    const params: unknown[] = [];
+
+    if (filters?.peerId) {
+      clauses.push("peer_id = ?");
+      params.push(filters.peerId);
+    }
+    if (filters?.direction) {
+      clauses.push("direction = ?");
+      params.push(filters.direction);
+    }
+    if (filters?.status) {
+      clauses.push("status = ?");
+      params.push(filters.status);
+    }
+
+    const whereClause = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+    const rows = this.alphaDb
+      .prepare(`${agentMessageSelectSql} ${whereClause} ORDER BY created_at DESC LIMIT ?`)
+      .all(...params, safeLimit) as AgentMessageRow[];
+    return rows.map((row) => this.toAgentMessage(row));
+  }
+
+  updateAgentMessageStatus(
+    id: string,
+    status: AgentMessageStatus,
+    patch?: {
+      txHash?: string;
+      sentAt?: string;
+      receivedAt?: string;
+      executedAt?: string;
+      error?: string;
+    },
+  ): AgentMessage {
+    const now = new Date().toISOString();
+    this.runPreparedStatement(
+      this.alphaDb,
+      `UPDATE agent_messages
+       SET status = ?,
+           tx_hash = COALESCE(?, tx_hash),
+           sent_at = COALESCE(?, sent_at),
+           received_at = COALESCE(?, received_at),
+           executed_at = COALESCE(?, executed_at),
+           error = COALESCE(?, error),
+           updated_at = ?
+       WHERE id = ?`,
+      status,
+      patch?.txHash ?? null,
+      patch?.sentAt ?? null,
+      patch?.receivedAt ?? null,
+      patch?.executedAt ?? null,
+      patch?.error ?? null,
+      now,
+      id,
+    );
+
+    return this.getRequiredAgentMessage(id, `agent message not found: ${id}`);
+  }
+
+  upsertListenerCursor(input: {
+    address: string;
+    chainId: string | number;
+    cursor: string;
+  }): ListenerCursor {
+    const normalizedChainId = String(input.chainId);
+    const now = new Date().toISOString();
+    this.runPreparedStatement(
+      this.alphaDb,
+      `INSERT INTO listener_cursors (address, chain_id, cursor, updated_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(address, chain_id) DO UPDATE SET
+         cursor = excluded.cursor,
+         updated_at = excluded.updated_at`,
+      input.address,
+      normalizedChainId,
+      input.cursor,
+      now,
+    );
+
+    return this.getRequiredListenerCursor(
+      input.address,
+      normalizedChainId,
+      `listener cursor not found after upsert: ${input.address}:${normalizedChainId}`,
+    );
+  }
+
+  getListenerCursor(address: string, chainId: string | number): ListenerCursor | null {
+    const row = this.alphaDb
+      .prepare(`${listenerCursorSelectSql} WHERE address = ? AND chain_id = ?`)
+      .get(address, String(chainId)) as ListenerCursorRow | undefined;
+    return row ? this.toListenerCursor(row) : null;
+  }
+
+  private getRequiredListenerCursor(
+    address: string,
+    chainId: string,
+    errorMessage: string,
+  ): ListenerCursor {
+    const cursor = this.getListenerCursor(address, chainId);
+    if (!cursor) {
+      throw new Error(errorMessage);
+    }
+    return cursor;
+  }
+
+  insertDiscoverySession(input: {
+    strategyId: DiscoveryStrategyId;
+    pairs: string[];
+    startedAt: string;
+    plannedEndAt: string;
+    config: DiscoverySessionConfig;
+  }): DiscoverySession {
+    const id = crypto.randomUUID();
+    const status: DiscoverySessionStatus = "active";
+    this.runPreparedStatement(
+      this.alphaDb,
+      `INSERT INTO discovery_sessions (
+        id, strategy_id, status, pairs_json, started_at, planned_end_at, ended_at, config_json, summary_json
+      ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL)`,
+      id,
+      input.strategyId,
+      status,
+      JSON.stringify(input.pairs),
+      input.startedAt,
+      input.plannedEndAt,
+      JSON.stringify(input.config),
+    );
+    const session = this.getDiscoverySession(id);
+    if (!session) {
+      throw new Error("failed to read inserted discovery session");
+    }
+    return session;
+  }
+
+  getActiveDiscoverySession(): DiscoverySession | null {
+    const row = this.alphaDb
+      .prepare(
+        `SELECT id,
+                strategy_id AS strategyId,
+                status,
+                pairs_json AS pairsJson,
+                started_at AS startedAt,
+                planned_end_at AS plannedEndAt,
+                ended_at AS endedAt,
+                config_json AS configJson,
+                summary_json AS summaryJson
+         FROM discovery_sessions
+         WHERE status = 'active'
+         ORDER BY started_at DESC
+         LIMIT 1`,
+      )
+      .get() as
+      | {
+          id: string;
+          strategyId: DiscoveryStrategyId;
+          status: DiscoverySessionStatus;
+          pairsJson: string;
+          startedAt: string;
+          plannedEndAt: string;
+          endedAt: string | null;
+          configJson: string;
+          summaryJson: string | null;
+        }
+      | undefined;
+    return row ? this.toDiscoverySession(row) : null;
+  }
+
+  getDiscoverySession(id: string): DiscoverySession | null {
+    const row = this.alphaDb
+      .prepare(
+        `SELECT id,
+                strategy_id AS strategyId,
+                status,
+                pairs_json AS pairsJson,
+                started_at AS startedAt,
+                planned_end_at AS plannedEndAt,
+                ended_at AS endedAt,
+                config_json AS configJson,
+                summary_json AS summaryJson
+         FROM discovery_sessions
+         WHERE id = ?`,
+      )
+      .get(id) as
+      | {
+          id: string;
+          strategyId: DiscoveryStrategyId;
+          status: DiscoverySessionStatus;
+          pairsJson: string;
+          startedAt: string;
+          plannedEndAt: string;
+          endedAt: string | null;
+          configJson: string;
+          summaryJson: string | null;
+        }
+      | undefined;
+    return row ? this.toDiscoverySession(row) : null;
+  }
+
+  updateDiscoverySessionStatus(
+    id: string,
+    status: DiscoverySessionStatus,
+    endedAt?: string,
+  ): DiscoverySession {
+    const finalEndedAt = endedAt ?? (status === "active" ? null : new Date().toISOString());
+    this.runPreparedStatement(
+      this.alphaDb,
+      "UPDATE discovery_sessions SET status = ?, ended_at = ? WHERE id = ?",
+      status,
+      finalEndedAt,
+      id,
+    );
+    const session = this.getDiscoverySession(id);
+    if (!session) {
+      throw new Error(`discovery session not found: ${id}`);
+    }
+    return session;
+  }
+
+  updateDiscoverySessionSummary(id: string, summary: DiscoverySessionSummary): void {
+    this.runPreparedStatement(
+      this.alphaDb,
+      "UPDATE discovery_sessions SET summary_json = ? WHERE id = ?",
+      JSON.stringify(summary),
+      id,
+    );
+  }
+
+  insertDiscoverySample(input: {
+    sessionId: string;
+    pair: string;
+    ts: string;
+    dexAMid: number;
+    dexBMid: number;
+    spreadBps: number;
+    volatility: number | null;
+    zScore: number | null;
+    features: Record<string, unknown>;
+  }): string {
+    const id = crypto.randomUUID();
+    this.runPreparedStatement(
+      this.alphaDb,
+      `INSERT INTO discovery_samples (
+        id, session_id, pair, ts, dex_a_mid, dex_b_mid, spread_bps, volatility, z_score, features_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      id,
+      input.sessionId,
+      input.pair,
+      input.ts,
+      input.dexAMid,
+      input.dexBMid,
+      input.spreadBps,
+      input.volatility,
+      input.zScore,
+      JSON.stringify(input.features),
+    );
+    return id;
+  }
+
+  listDiscoverySamples(sessionId: string, limit = 2000): DiscoverySample[] {
+    const safeLimit = Math.max(1, Math.min(20_000, Math.floor(limit)));
+    const rows = this.alphaDb
+      .prepare(
+        `SELECT id,
+                session_id AS sessionId,
+                pair,
+                ts,
+                dex_a_mid AS dexAMid,
+                dex_b_mid AS dexBMid,
+                spread_bps AS spreadBps,
+                volatility,
+                z_score AS zScore,
+                features_json AS featuresJson
+         FROM discovery_samples
+         WHERE session_id = ?
+         ORDER BY ts ASC
+         LIMIT ?`,
+      )
+      .all(sessionId, safeLimit) as Array<{
+      id: string;
+      sessionId: string;
+      pair: string;
+      ts: string;
+      dexAMid: number;
+      dexBMid: number;
+      spreadBps: number;
+      volatility: number | null;
+      zScore: number | null;
+      featuresJson: string;
+    }>;
+    return rows.map((row) => ({
+      id: row.id,
+      sessionId: row.sessionId,
+      pair: row.pair,
+      ts: row.ts,
+      dexAMid: row.dexAMid,
+      dexBMid: row.dexBMid,
+      spreadBps: row.spreadBps,
+      volatility: row.volatility,
+      zScore: row.zScore,
+      features: JSON.parse(row.featuresJson) as Record<string, unknown>,
+    }));
+  }
+
+  listRecentDiscoverySamples(sessionId: string, pair: string, limit: number): DiscoverySample[] {
+    const safeLimit = Math.max(1, Math.min(5000, Math.floor(limit)));
+    const rows = this.alphaDb
+      .prepare(
+        `SELECT id,
+                session_id AS sessionId,
+                pair,
+                ts,
+                dex_a_mid AS dexAMid,
+                dex_b_mid AS dexBMid,
+                spread_bps AS spreadBps,
+                volatility,
+                z_score AS zScore,
+                features_json AS featuresJson
+         FROM discovery_samples
+         WHERE session_id = ? AND pair = ?
+         ORDER BY ts DESC
+         LIMIT ?`,
+      )
+      .all(sessionId, pair, safeLimit) as Array<{
+      id: string;
+      sessionId: string;
+      pair: string;
+      ts: string;
+      dexAMid: number;
+      dexBMid: number;
+      spreadBps: number;
+      volatility: number | null;
+      zScore: number | null;
+      featuresJson: string;
+    }>;
+    return rows
+      .reverse()
+      .map((row) => ({
+        id: row.id,
+        sessionId: row.sessionId,
+        pair: row.pair,
+        ts: row.ts,
+        dexAMid: row.dexAMid,
+        dexBMid: row.dexBMid,
+        spreadBps: row.spreadBps,
+        volatility: row.volatility,
+        zScore: row.zScore,
+        features: JSON.parse(row.featuresJson) as Record<string, unknown>,
+      }));
+  }
+
+  getLatestDiscoverySampleTs(sessionId: string): string | null {
+    const row = this.alphaDb
+      .prepare(
+        `SELECT ts
+         FROM discovery_samples
+         WHERE session_id = ?
+         ORDER BY ts DESC
+         LIMIT 1`,
+      )
+      .get(sessionId) as { ts: string } | undefined;
+    return row?.ts ?? null;
+  }
+
+  insertDiscoveryCandidate(input: Omit<DiscoveryCandidate, "id" | "status">): string {
+    const id = crypto.randomUUID();
+    const status: DiscoveryCandidateStatus = "pending";
+    this.runPreparedStatement(
+      this.alphaDb,
+      `INSERT INTO discovery_candidates (
+        id, session_id, strategy_id, pair, buy_dex, sell_dex, signal_ts, score, expected_net_bps,
+        expected_net_usd, confidence, reason, input_json, status, approved_at, executed_trade_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)`,
+      id,
+      input.sessionId,
+      input.strategyId,
+      input.pair,
+      input.buyDex,
+      input.sellDex,
+      input.signalTs,
+      input.score,
+      input.expectedNetBps,
+      input.expectedNetUsd,
+      input.confidence,
+      input.reason,
+      JSON.stringify(input.input),
+      status,
+    );
+    return id;
+  }
+
+  listDiscoveryCandidates(sessionId: string, limit = 50): DiscoveryCandidate[] {
+    const safeLimit = Math.max(1, Math.min(500, Math.floor(limit)));
+    const rows = this.alphaDb
+      .prepare(
+        `SELECT id,
+                session_id AS sessionId,
+                strategy_id AS strategyId,
+                pair,
+                buy_dex AS buyDex,
+                sell_dex AS sellDex,
+                signal_ts AS signalTs,
+                score,
+                expected_net_bps AS expectedNetBps,
+                expected_net_usd AS expectedNetUsd,
+                confidence,
+                reason,
+                input_json AS inputJson,
+                status,
+                approved_at AS approvedAt,
+                executed_trade_id AS executedTradeId
+         FROM discovery_candidates
+         WHERE session_id = ?
+         ORDER BY score DESC, signal_ts DESC
+         LIMIT ?`,
+      )
+      .all(sessionId, safeLimit) as Array<{
+      id: string;
+      sessionId: string;
+      strategyId: DiscoveryStrategyId;
+      pair: string;
+      buyDex: string;
+      sellDex: string;
+      signalTs: string;
+      score: number;
+      expectedNetBps: number;
+      expectedNetUsd: number;
+      confidence: number;
+      reason: string;
+      inputJson: string;
+      status: DiscoveryCandidateStatus;
+      approvedAt: string | null;
+      executedTradeId: string | null;
+    }>;
+    return rows.map((row) => this.toDiscoveryCandidate(row));
+  }
+
+  getDiscoveryCandidate(sessionId: string, candidateId: string): DiscoveryCandidate | null {
+    const row = this.alphaDb
+      .prepare(
+        `SELECT id,
+                session_id AS sessionId,
+                strategy_id AS strategyId,
+                pair,
+                buy_dex AS buyDex,
+                sell_dex AS sellDex,
+                signal_ts AS signalTs,
+                score,
+                expected_net_bps AS expectedNetBps,
+                expected_net_usd AS expectedNetUsd,
+                confidence,
+                reason,
+                input_json AS inputJson,
+                status,
+                approved_at AS approvedAt,
+                executed_trade_id AS executedTradeId
+         FROM discovery_candidates
+         WHERE session_id = ? AND id = ?
+         LIMIT 1`,
+      )
+      .get(sessionId, candidateId) as
+      | {
+          id: string;
+          sessionId: string;
+          strategyId: DiscoveryStrategyId;
+          pair: string;
+          buyDex: string;
+          sellDex: string;
+          signalTs: string;
+          score: number;
+          expectedNetBps: number;
+          expectedNetUsd: number;
+          confidence: number;
+          reason: string;
+          inputJson: string;
+          status: DiscoveryCandidateStatus;
+          approvedAt: string | null;
+          executedTradeId: string | null;
+        }
+      | undefined;
+    return row ? this.toDiscoveryCandidate(row) : null;
+  }
+
+  updateDiscoveryCandidateStatus(
+    candidateId: string,
+    status: DiscoveryCandidateStatus,
+    approvedAt?: string,
+  ): void {
+    this.runPreparedStatement(
+      this.alphaDb,
+      "UPDATE discovery_candidates SET status = ?, approved_at = COALESCE(?, approved_at) WHERE id = ?",
+      status,
+      approvedAt ?? null,
+      candidateId,
+    );
+  }
+
+  updateDiscoveryCandidateExecution(
+    candidateId: string,
+    status: "executed" | "failed",
+    executedTradeId?: string,
+  ): void {
+    this.runPreparedStatement(
+      this.alphaDb,
+      "UPDATE discovery_candidates SET status = ?, executed_trade_id = ? WHERE id = ?",
+      status,
+      executedTradeId ?? null,
+      candidateId,
+    );
+  }
+
+  upsertDiscoveryReport(sessionId: string, report: DiscoveryReport, createdAt: string): void {
+    this.runPreparedStatement(
+      this.alphaDb,
+      `INSERT INTO discovery_reports (session_id, report_json, created_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(session_id) DO UPDATE SET
+         report_json = excluded.report_json,
+         created_at = excluded.created_at`,
+      sessionId,
+      JSON.stringify(report),
+      createdAt,
+    );
+  }
+
+  getDiscoveryReport(sessionId: string): DiscoveryReport | null {
+    const row = this.alphaDb
+      .prepare(
+        `SELECT report_json AS reportJson
+         FROM discovery_reports
+         WHERE session_id = ?`,
+      )
+      .get(sessionId) as { reportJson: string } | undefined;
+    if (!row) {
+      return null;
+    }
+    return JSON.parse(row.reportJson) as DiscoveryReport;
+  }
+
   insertMarketSnapshot(input: { pair: string; dex: string; bid: number; ask: number; ts: string }): void {
     this.runPreparedStatement(
       this.alphaDb,
@@ -536,8 +1631,9 @@ export class StateStore {
     );
   }
 
-  insertTrade(opportunityId: string, mode: ExecutionMode, trade: TradeResult, createdAt: string): void {
+  insertTrade(opportunityId: string, mode: ExecutionMode, trade: TradeResult, createdAt: string): string {
     const day = utcDay(new Date(createdAt));
+    const tradeId = crypto.randomUUID();
     const transaction = this.alphaDb.transaction(() => {
       this.runPreparedStatement(
         this.alphaDb,
@@ -545,7 +1641,7 @@ export class StateStore {
           id, opportunity_id, mode, tx_hash, status, gross_usd, fee_usd, net_usd,
           error_type, latency_ms, slippage_deviation_bps, created_at, settled_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        crypto.randomUUID(),
+        tradeId,
         opportunityId,
         mode,
         trade.txHash,
@@ -577,6 +1673,7 @@ export class StateStore {
       );
     });
     transaction();
+    return tradeId;
   }
 
   insertAlert(level: string, eventType: string, message: string): void {
@@ -778,12 +1875,175 @@ export class StateStore {
       return null;
     }
 
-    const signed = row.netUsd >= 0 ? `+${row.netUsd.toFixed(2)}` : row.netUsd.toFixed(2);
+    const signed = formatSignedUsd(row.netUsd);
     return {
       ...row,
-      title: `AlphaOS ${row.strategyId} ${signed} USD`,
-      text: `AlphaOS ${row.strategyId} executed ${row.pair} in ${row.mode} mode, PnL ${signed} USD. tx=${row.txHash}`,
+      title: `AlphaOS 战报 ${row.pair} ${signed} USD`,
+      text: `【AlphaOS 战报】${row.strategyId} 在 ${row.mode} 模式完成 ${row.pair}，单笔 ${signed} USD。可信凭证 tx=${row.txHash} #OnchainOS #DEXArbitrage`,
     };
+  }
+
+  listGrowthMoments(limit = 5): GrowthMoment[] {
+    const safeLimit = Math.max(1, Math.min(20, Math.floor(limit)));
+    const day = utcDay();
+    const nowIso = new Date().toISOString();
+    const moments: GrowthMoment[] = [];
+    const metrics = this.getTodayMetrics();
+    const todaySigned = formatSignedUsd(metrics.netUsd);
+
+    moments.push({
+      id: `summary-${day}`,
+      category: "summary",
+      title: `AlphaOS 日报 ${todaySigned} USD`,
+      text: `今日机会 ${metrics.opportunities} 笔，成交 ${metrics.trades} 笔，净收益 ${todaySigned} USD，可通过回放与快照复盘。`,
+      timestamp: nowIso,
+      valueUsd: metrics.netUsd,
+      tags: ["日报", "可复盘", "透明"],
+    });
+
+    const latest = this.alphaDb
+      .prepare(
+        `SELECT t.tx_hash AS txHash,
+                t.mode AS mode,
+                t.net_usd AS netUsd,
+                t.created_at AS timestamp,
+                o.pair AS pair,
+                o.strategy_id AS strategyId
+         FROM trades t
+         JOIN opportunities o ON o.id = t.opportunity_id
+         WHERE t.status != 'failed'
+         ORDER BY t.created_at DESC
+         LIMIT 1`,
+      )
+      .get() as
+      | {
+          txHash: string;
+          mode: ExecutionMode;
+          netUsd: number;
+          timestamp: string;
+          pair: string;
+          strategyId: string;
+        }
+      | undefined;
+
+    if (latest) {
+      const signed = formatSignedUsd(latest.netUsd);
+      moments.push({
+        id: `latest-${latest.txHash}`,
+        category: "trade",
+        title: `最新成交 ${signed} USD`,
+        text: `最新成交：${latest.strategyId} ${latest.pair} ${latest.mode} 模式实现 ${signed} USD，tx=${latest.txHash}。`,
+        timestamp: latest.timestamp,
+        valueUsd: latest.netUsd,
+        tags: ["最新", "成交", latest.mode],
+      });
+    }
+
+    const bestToday = this.alphaDb
+      .prepare(
+        `SELECT t.tx_hash AS txHash,
+                t.mode AS mode,
+                t.net_usd AS netUsd,
+                t.created_at AS timestamp,
+                o.pair AS pair,
+                o.strategy_id AS strategyId
+         FROM trades t
+         JOIN opportunities o ON o.id = t.opportunity_id
+         WHERE substr(t.created_at, 1, 10) = ?
+           AND t.status != 'failed'
+         ORDER BY t.net_usd DESC, t.created_at DESC
+         LIMIT 1`,
+      )
+      .get(day) as
+      | {
+          txHash: string;
+          mode: ExecutionMode;
+          netUsd: number;
+          timestamp: string;
+          pair: string;
+          strategyId: string;
+        }
+      | undefined;
+
+    if (bestToday && bestToday.txHash !== latest?.txHash) {
+      const signed = formatSignedUsd(bestToday.netUsd);
+      moments.push({
+        id: `best-${bestToday.txHash}`,
+        category: "trade",
+        title: `今日最佳单 ${signed} USD`,
+        text: `今日最佳：${bestToday.strategyId} ${bestToday.pair} ${bestToday.mode} 模式单笔 ${signed} USD，tx=${bestToday.txHash}。`,
+        timestamp: bestToday.timestamp,
+        valueUsd: bestToday.netUsd,
+        tags: ["最佳单", "今日", bestToday.mode],
+      });
+    }
+
+    const streakRows = this.alphaDb
+      .prepare(
+        `SELECT t.status AS status,
+                t.net_usd AS netUsd
+         FROM trades t
+         WHERE substr(t.created_at, 1, 10) = ?
+         ORDER BY t.created_at DESC
+         LIMIT 20`,
+      )
+      .all(day) as Array<{ status: string; netUsd: number }>;
+    let streakCount = 0;
+    let streakNetUsd = 0;
+    for (const row of streakRows) {
+      if (row.status === "failed" || row.netUsd <= 0) {
+        break;
+      }
+      streakCount += 1;
+      streakNetUsd += row.netUsd;
+    }
+    if (streakCount >= 2) {
+      const signed = formatSignedUsd(streakNetUsd);
+      moments.push({
+        id: `streak-${day}`,
+        category: "streak",
+        title: `连胜 ${streakCount} 单`,
+        text: `当前连胜 ${streakCount} 单，累计 ${signed} USD。`,
+        timestamp: nowIso,
+        valueUsd: streakNetUsd,
+        tags: ["连胜", "动量", "传播点"],
+      });
+    }
+
+    const safetyAlerts = this.alphaDb
+      .prepare(
+        `SELECT event_type AS eventType, created_at AS createdAt
+         FROM alerts
+         WHERE substr(created_at, 1, 10) = ?
+           AND event_type IN ('live_permission_degraded', 'circuit_breaker')
+         ORDER BY created_at DESC
+         LIMIT 5`,
+      )
+      .all(day) as Array<{ eventType: string; createdAt: string }>;
+
+    if (safetyAlerts.length === 0) {
+      moments.push({
+        id: `safety-ok-${day}`,
+        category: "safety",
+        title: "风控守护正常",
+        text: "今日未触发熔断/权限降级告警，系统运行在风险阈值内。",
+        timestamp: nowIso,
+        tags: ["风控", "稳定", "可信"],
+      });
+    } else {
+      const latestSafety = safetyAlerts[0];
+      moments.push({
+        id: `safety-alert-${day}`,
+        category: "safety",
+        title: `风控事件 ${safetyAlerts.length} 次`,
+        text: `今日触发 ${safetyAlerts.length} 次风控保护，最近事件=${latestSafety?.eventType ?? "unknown"}。`,
+        timestamp: latestSafety?.createdAt ?? nowIso,
+        tags: ["风控", "保护触发", "降级"],
+      });
+    }
+
+    moments.sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
+    return moments.slice(0, safeLimit);
   }
 
   getBacktestSnapshot(hours: number): BacktestSnapshotRow[] {
@@ -1011,95 +2271,6 @@ export class StateStore {
       liquidityMedianUsd24h: quantile(liquidities, 0.5),
       samples: rows.length,
     };
-  }
-
-  insertWhaleSignal(input: {
-    wallet: string;
-    token: string;
-    side: "buy" | "sell";
-    sizeUsd: number;
-    confidence: number;
-    sourceTxHash?: string;
-  }): string {
-    const id = crypto.randomUUID();
-    this.runPreparedStatement(
-      this.alphaDb,
-      `INSERT INTO whale_signals (
-        id, wallet, token, side, size_usd, confidence, source_tx_hash, status, received_at, processed_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL)`,
-      id,
-      input.wallet,
-      input.token,
-      input.side,
-      input.sizeUsd,
-      input.confidence,
-      input.sourceTxHash ?? null,
-      new Date().toISOString(),
-    );
-    return id;
-  }
-
-  listWhaleSignals(status: "pending" | "processing" | "consumed" | "ignored" | "all", limit: number): WhaleSignal[] {
-    const sql =
-      status === "all"
-        ? `SELECT id, wallet, token, side, size_usd AS sizeUsd, confidence, source_tx_hash AS sourceTxHash,
-                  status, received_at AS receivedAt, processed_at AS processedAt
-           FROM whale_signals ORDER BY received_at DESC LIMIT ?`
-        : `SELECT id, wallet, token, side, size_usd AS sizeUsd, confidence, source_tx_hash AS sourceTxHash,
-                  status, received_at AS receivedAt, processed_at AS processedAt
-           FROM whale_signals WHERE status = ? ORDER BY received_at DESC LIMIT ?`;
-    return (status === "all"
-      ? this.alphaDb.prepare(sql).all(limit)
-      : this.alphaDb.prepare(sql).all(status, limit)) as WhaleSignal[];
-  }
-
-  claimPendingWhaleSignals(limit: number): WhaleSignal[] {
-    const safeLimit = Math.max(1, Math.min(1000, Math.floor(limit)));
-    const now = new Date().toISOString();
-    const transaction = this.alphaDb.transaction(() => {
-      const signals = this.alphaDb
-        .prepare(
-          `SELECT id, wallet, token, side, size_usd AS sizeUsd, confidence, source_tx_hash AS sourceTxHash,
-                  status, received_at AS receivedAt, processed_at AS processedAt
-           FROM whale_signals
-           WHERE status = 'pending'
-           ORDER BY received_at ASC
-           LIMIT ?`,
-        )
-        .all(safeLimit) as WhaleSignal[];
-
-      const claimedSignals: WhaleSignal[] = [];
-      for (const signal of signals) {
-        const result = this.alphaDb
-          .prepare(
-            "UPDATE whale_signals SET status = 'processing', processed_at = ? WHERE id = ? AND status = 'pending'",
-          )
-          .run(now, signal.id);
-
-        if (result.changes !== 1) {
-          continue;
-        }
-
-        claimedSignals.push({
-          ...signal,
-          status: "processing" as const,
-          processedAt: now,
-        });
-      }
-
-      return claimedSignals;
-    });
-    return transaction();
-  }
-
-  updateWhaleSignalStatus(id: string, status: "consumed" | "ignored"): void {
-    this.runPreparedStatement(
-      this.alphaDb,
-      "UPDATE whale_signals SET status = ?, processed_at = ? WHERE id = ? AND status = 'processing'",
-      status,
-      new Date().toISOString(),
-      id,
-    );
   }
 
   enqueueOutbox(endpoint: string, payload: string, nextRetryAt: string, status: "pending" | "dead" = "pending", retryCount = 0, lastError: string | null = null): void {

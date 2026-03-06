@@ -5,11 +5,25 @@ import { StateStore } from "./state-store";
 export interface NotifyEvent {
   mode: ExecutionMode;
   level: "info" | "warn" | "error";
-  event: "alpha_found" | "paper_passed" | "trade_executed" | "risk_alert" | "engine_recovered";
+  event:
+    | "alpha_found"
+    | "paper_passed"
+    | "trade_executed"
+    | "risk_alert"
+    | "engine_recovered"
+    | "discovery_started"
+    | "discovery_progress"
+    | "discovery_report_ready"
+    | "discovery_candidate_approved"
+    | "discovery_candidate_executed"
+    | "discovery_candidate_failed";
   pair?: string;
   netUsd?: number;
   txHash?: string;
   strategyId?: string;
+  sessionId?: string;
+  candidateId?: string;
+  detail?: string;
 }
 
 interface NotifierOptions {
@@ -64,7 +78,10 @@ export class OpenClawNotifier {
     const net = typeof event.netUsd === "number" ? event.netUsd.toFixed(4) : "na";
     const tx = event.txHash ?? "na";
     const strategy = event.strategyId ?? "na";
-    return `[alphaos][${event.mode}][${event.level}] ${event.event} strategy=${strategy} pair=${pair} net=${net} tx=${tx}`;
+    const session = event.sessionId ?? "na";
+    const candidate = event.candidateId ?? "na";
+    const detail = event.detail ? ` detail=${event.detail}` : "";
+    return `[alphaos][${event.mode}][${event.level}] ${event.event} strategy=${strategy} pair=${pair} net=${net} tx=${tx} session=${session} candidate=${candidate}${detail}`;
   }
 
   private async send(url: string, payload: { text: string; mode: "now" }): Promise<void> {

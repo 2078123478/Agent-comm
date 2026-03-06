@@ -58,4 +58,3 @@ Use `StrategyPlugin` in `src/skills/alphaos/types.ts`:
 - Add new plugins in `src/skills/alphaos/plugins`.
 - Add richer OnchainOS API adapters in `runtime/onchainos-client.ts`.
 - Add custom hook mappers in OpenClaw side if richer delivery is needed.
-- Ingest external alpha signals via `POST /api/v1/signals/whale` and let `smart-money-mirror` consume them.

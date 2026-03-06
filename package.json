@@ -9,6 +9,7 @@
     "start": "node dist/index.js",
     "test:watch": "vitest",
     "demo:run": "bash scripts/hackathon-demo.sh",
+    "demo:discovery": "bash scripts/discovery-demo.sh",
     "demo:smoke:live": "bash scripts/onchainos-live-smoke.sh"
   },
   "keywords": [],
@@ -17,10 +18,14 @@
   "description": "",
   "private": true,
   "dependencies": {
+    "@noble/secp256k1": "^2.3.0",
+    "@scure/base": "^2.0.0",
     "better-sqlite3": "^12.6.2",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
-    "pino": "^10.3.1"
+    "pino": "^10.3.1",
+    "viem": "^2.47.0",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",

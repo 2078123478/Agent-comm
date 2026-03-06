@@ -1,6 +1,5 @@
 import type { Logger } from "pino";
 import { DexArbitragePlugin } from "./plugins/dex-arbitrage";
-import { SmartMoneyMirrorPlugin } from "./plugins/smart-money-mirror";
 import { AlphaEngine } from "./engine/alpha-engine";
 import type { SkillManifest, StrategyPlugin } from "./types";
 import { MarketWatch } from "./runtime/market-watch";
@@ -9,9 +8,10 @@ import { OpenClawNotifier } from "./runtime/notifier";
 import { RiskEngine } from "./runtime/risk-engine";
 import { Simulator } from "./runtime/simulator";
 import { StateStore } from "./runtime/state-store";
+import { DiscoveryEngine } from "./runtime/discovery/discovery-engine";
 import type { AlphaOsConfig } from "./runtime/config";
 
-function buildPlugins(config: AlphaOsConfig, store: StateStore): StrategyPlugin[] {
+function buildPlugins(config: AlphaOsConfig): StrategyPlugin[] {
   const plugins: StrategyPlugin[] = [];
   const enabled = new Set(config.enabledStrategies);
 
@@ -29,10 +29,6 @@ function buildPlugins(config: AlphaOsConfig, store: StateStore): StrategyPlugin[
         evalNotionalUsdDefault: config.evalNotionalUsdDefault,
       }),
     );
-  }
-
-  if (enabled.has("smart-money-mirror")) {
-    plugins.push(new SmartMoneyMirrorPlugin(store, config.mirrorMinConfidence));
   }
 
   if (plugins.length === 0) {
@@ -56,7 +52,7 @@ function buildPlugins(config: AlphaOsConfig, store: StateStore): StrategyPlugin[
 
 export function createAlphaOsSkill(config: AlphaOsConfig, logger: Logger) {
   const store = new StateStore(config.dataDir);
-  const plugins = buildPlugins(config, store);
+  const plugins = buildPlugins(config);
 
   for (const plugin of plugins) {
     const rawDefaults = config.strategyProfileDefaults[plugin.id];
@@ -153,9 +149,32 @@ export function createAlphaOsSkill(config: AlphaOsConfig, logger: Logger) {
     onchain,
   );
 
+  const discovery = new DiscoveryEngine(
+    store,
+    onchain,
+    notifier,
+    {
+      dexes: config.dexes,
+      defaultDurationMinutes: config.discoveryDefaultDurationMinutes,
+      defaultSampleIntervalSec: config.discoveryDefaultSampleIntervalSec,
+      defaultTopN: config.discoveryDefaultTopN,
+      lookbackSamples: config.discoveryLookbackSamples,
+      zEnter: config.discoveryZEnter,
+      volRatioMin: config.discoveryVolRatioMin,
+      minSpreadBps: config.discoveryMinSpreadBps,
+      notionalUsd: config.discoveryNotionalUsd,
+      takerFeeBps: config.takerFeeBps,
+      slippageBps: config.slippageBps,
+      mevPenaltyBps: config.mevPenaltyBps,
+      gasUsdDefault: config.gasUsdDefault,
+    },
+    async (candidate, mode) => engine.executeApprovedCandidate(candidate, mode),
+  );
+
   return {
     manifest,
     engine,
+    discovery,
     store,
     onchain,
   };

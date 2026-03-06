@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type Database from "better-sqlite3";
+import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { StateStore } from "../src/skills/alphaos/runtime/state-store";
 
@@ -56,39 +56,6 @@ describe("StateStore P0 safety", () => {
     ).toThrow(/forced pnl failure/);
 
     expect((store.listTrades(10) as unknown[]).length).toBe(0);
-
-    store.close();
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
-
-  it("claims whale signals atomically through pending -> processing -> consumed/ignored", () => {
-    const { dir, store } = createStore("alphaos-state-");
-    const first = store.insertWhaleSignal({
-      wallet: "0xabc",
-      token: "ETH",
-      side: "buy",
-      sizeUsd: 20000,
-      confidence: 0.9,
-    });
-    const second = store.insertWhaleSignal({
-      wallet: "0xdef",
-      token: "SOL",
-      side: "sell",
-      sizeUsd: 10000,
-      confidence: 0.8,
-    });
-
-    const claimed = store.claimPendingWhaleSignals(10);
-    expect(claimed.length).toBe(2);
-    expect(claimed.every((signal) => signal.status === "processing")).toBe(true);
-    expect(store.claimPendingWhaleSignals(10).length).toBe(0);
-
-    store.updateWhaleSignalStatus(first, "consumed");
-    store.updateWhaleSignalStatus(second, "ignored");
-
-    expect(store.listWhaleSignals("processing", 10).length).toBe(0);
-    expect(store.listWhaleSignals("consumed", 10).length).toBe(1);
-    expect(store.listWhaleSignals("ignored", 10).length).toBe(1);
 
     store.close();
     fs.rmSync(dir, { recursive: true, force: true });
@@ -288,6 +255,202 @@ describe("StateStore P0 safety", () => {
     const metrics = store.getTodayMetrics();
     expect(metrics.staleQuotes).toBe(2);
     expect(metrics.avgQuoteLatencyMs).toBe(250);
+
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("persists phase 2 agent peer, message, and cursor CRUD with message nonce dedupe", () => {
+    const { dir, store } = createStore("alphaos-state-");
+
+    const peer = store.upsertAgentPeer({
+      peerId: "peer-1",
+      walletAddress: "0xpeer1",
+      pubkey: "pubkey-1",
+      name: "Peer One",
+      status: "trusted",
+      capabilities: ["ping", "start_discovery"],
+      metadata: { source: "test" },
+    });
+    expect(store.getAgentPeer(peer.peerId)?.name).toBe("Peer One");
+    expect(store.getAgentPeerByWalletAddress(peer.walletAddress)?.peerId).toBe(peer.peerId);
+    expect(store.listAgentPeers(10, "trusted").map((item) => item.peerId)).toContain(peer.peerId);
+
+    const message = store.insertAgentMessage({
+      id: "msg-1",
+      direction: "outbound",
+      peerId: peer.peerId,
+      nonce: "nonce-1",
+      commandType: "ping",
+      ciphertext: "0xdeadbeef",
+      status: "pending",
+    });
+    expect(store.getAgentMessage(message.id)?.nonce).toBe("nonce-1");
+
+    const updatedMessage = store.updateAgentMessageStatus(message.id, "sent", {
+      txHash: "0xtx1",
+      sentAt: "2026-03-06T00:00:00.000Z",
+    });
+    expect(updatedMessage.txHash).toBe("0xtx1");
+    expect(updatedMessage.status).toBe("sent");
+    expect(
+      store.listAgentMessages(10, {
+        peerId: peer.peerId,
+        direction: "outbound",
+        status: "sent",
+      }),
+    ).toHaveLength(1);
+
+    expect(() =>
+      store.insertAgentMessage({
+        id: "msg-dup",
+        direction: "outbound",
+        peerId: peer.peerId,
+        nonce: "nonce-1",
+        commandType: "ping",
+        ciphertext: "0xduplicate",
+      }),
+    ).toThrow(/UNIQUE constraint failed|unique/i);
+
+    const cursor = store.upsertListenerCursor({
+      address: "0xlistener",
+      chainId: 8453,
+      cursor: "12345",
+    });
+    expect(cursor.chainId).toBe("8453");
+    expect(store.getListenerCursor("0xlistener", "8453")?.cursor).toBe("12345");
+    expect(
+      store.upsertListenerCursor({
+        address: "0xlistener",
+        chainId: "8453",
+        cursor: "12346",
+      }).cursor,
+    ).toBe("12346");
+
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("drops obsolete agent comm tables and enforces message uniqueness when opening a legacy db", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "alphaos-state-legacy-"));
+    const legacyDb = new Database(path.join(dir, "alpha.db"));
+    legacyDb.exec(`
+      CREATE TABLE agent_peers (
+        peer_id TEXT PRIMARY KEY,
+        name TEXT,
+        wallet_address TEXT NOT NULL UNIQUE,
+        pubkey TEXT NOT NULL,
+        status TEXT NOT NULL,
+        capabilities_json TEXT NOT NULL,
+        metadata_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE agent_messages (
+        id TEXT PRIMARY KEY,
+        direction TEXT NOT NULL,
+        peer_id TEXT NOT NULL,
+        tx_hash TEXT,
+        nonce TEXT NOT NULL,
+        command_type TEXT NOT NULL,
+        ciphertext TEXT NOT NULL,
+        status TEXT NOT NULL,
+        sent_at TEXT,
+        received_at TEXT,
+        executed_at TEXT,
+        error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE agent_message_receipts (
+        id TEXT PRIMARY KEY,
+        message_id TEXT NOT NULL,
+        receipt_type TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE agent_sessions (
+        id TEXT PRIMARY KEY,
+        peer_id TEXT NOT NULL UNIQUE,
+        shared_key_hint TEXT,
+        last_nonce TEXT,
+        last_tx_hash TEXT,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE listener_cursors (
+        address TEXT NOT NULL,
+        chain_id TEXT NOT NULL,
+        cursor TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(address, chain_id)
+      );
+
+      CREATE TABLE x402_receipts (
+        id TEXT PRIMARY KEY,
+        message_id TEXT NOT NULL,
+        payer TEXT NOT NULL,
+        amount TEXT NOT NULL,
+        asset TEXT NOT NULL,
+        proof_json TEXT NOT NULL,
+        verified INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+      );
+    `);
+    legacyDb.close();
+
+    const store = new StateStore(dir);
+    const db = (store as unknown as { alphaDb: Database.Database }).alphaDb;
+    const tables = db
+      .prepare(
+        `SELECT name
+         FROM sqlite_master
+         WHERE type = 'table'
+           AND name IN (
+             'agent_peers',
+             'agent_messages',
+             'listener_cursors',
+             'agent_message_receipts',
+             'agent_sessions',
+             'x402_receipts'
+           )
+         ORDER BY name`,
+      )
+      .all() as Array<{ name: string }>;
+
+    expect(tables.map((row) => row.name)).toEqual([
+      "agent_messages",
+      "agent_peers",
+      "listener_cursors",
+    ]);
+
+    store.upsertAgentPeer({
+      peerId: "legacy-peer",
+      walletAddress: "0xlegacy",
+      pubkey: "legacy-pubkey",
+    });
+    store.insertAgentMessage({
+      id: "legacy-msg-1",
+      direction: "inbound",
+      peerId: "legacy-peer",
+      nonce: "legacy-nonce",
+      commandType: "ping",
+      ciphertext: "0x01",
+    });
+
+    expect(() =>
+      store.insertAgentMessage({
+        id: "legacy-msg-2",
+        direction: "inbound",
+        peerId: "legacy-peer",
+        nonce: "legacy-nonce",
+        commandType: "ping",
+        ciphertext: "0x02",
+      }),
+    ).toThrow(/UNIQUE constraint failed|unique/i);
 
     store.close();
     fs.rmSync(dir, { recursive: true, force: true });

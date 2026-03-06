@@ -22,24 +22,19 @@ request() {
   fi
 }
 
-echo "[1/8] health check"
+echo "[1/7] health check"
 request GET /health > /dev/null
 
-echo "[2/8] set strategy profile AB"
+echo "[2/7] set strategy profile AB"
 request POST /api/v1/strategies/profile '{"strategyId":"dex-arbitrage","variant":"B","params":{"notionalMultiplier":1.25,"minNetEdgeBpsPaper":35}}' > /dev/null
-request POST /api/v1/strategies/profile '{"strategyId":"smart-money-mirror","variant":"A","params":{"notionalMultiplier":1.10}}' > /dev/null
 
-echo "[3/8] force paper mode"
+echo "[3/7] force paper mode"
 request POST /api/v1/engine/mode '{"mode":"paper"}' > /dev/null
 
-echo "[4/8] inject whale signals"
-request POST /api/v1/signals/whale '{"wallet":"0xalpha01","token":"ETH","side":"buy","sizeUsd":180000,"confidence":0.92,"sourceTxHash":"0xsignal01"}' > /dev/null
-request POST /api/v1/signals/whale '{"wallet":"0xalpha02","token":"SOL","side":"buy","sizeUsd":120000,"confidence":0.87,"sourceTxHash":"0xsignal02"}' > /dev/null
-
-echo "[5/8] wait ${WAIT_SECONDS}s for strategy consumption"
+echo "[4/7] wait ${WAIT_SECONDS}s for engine ticks"
 sleep "$WAIT_SECONDS"
 
-echo "[6/8] capture metrics + share + strategy status + integration"
+echo "[5/7] capture metrics + share + strategy status + integration"
 {
   echo '{'
   echo '  "capturedAt": "'"$(date -Is)"'",'
@@ -53,6 +48,9 @@ echo "[6/8] capture metrics + share + strategy status + integration"
   echo '  "share":'
   request GET /api/v1/growth/share/latest || echo '{"error":"share unavailable"}'
   echo ','
+  echo '  "moments":'
+  request GET /api/v1/growth/moments?limit=5 || echo '{"error":"moments unavailable"}'
+  echo ','
   echo '  "integration":'
   request GET /api/v1/integration/onchainos/status || echo '{"error":"integration status unavailable"}'
   echo ','
@@ -61,10 +59,10 @@ echo "[6/8] capture metrics + share + strategy status + integration"
   echo '}'
 } > "$JSON_OUT"
 
-echo "[7/8] export backtest csv"
+echo "[6/7] export backtest csv"
 curl -sS "$BASE_URL/api/v1/backtest/snapshot?hours=24&format=csv" > "$CSV_OUT"
 
-echo "[8/8] done"
+echo "[7/7] done"
 echo "json: $JSON_OUT"
 echo "csv:  $CSV_OUT"
 

@@ -1,5 +1,8 @@
+import crypto from "node:crypto";
 import type { Logger } from "pino";
 import type {
+  DiscoveryApproveResult,
+  DiscoveryCandidate,
   EngineModeResponse,
   ExecutionMode,
   GateCheck,
@@ -41,20 +44,22 @@ interface EngineOptions {
   riskPolicy: RiskPolicy;
 }
 
+interface ExecutionPlanInput {
+  opportunityId: string;
+  strategyId: string;
+  pair: string;
+  buyDex: string;
+  sellDex: string;
+  buyPrice: number;
+  sellPrice: number;
+  notionalUsd: number;
+  metadata?: Record<string, unknown>;
+}
+
 interface TradeExecutor {
   execute(
     mode: ExecutionMode,
-    plan: {
-      opportunityId: string;
-      strategyId: string;
-      pair: string;
-      buyDex: string;
-      sellDex: string;
-      buyPrice: number;
-      sellPrice: number;
-      notionalUsd: number;
-      metadata?: Record<string, unknown>;
-    },
+    plan: ExecutionPlanInput,
     simulation: SimulationResult,
   ): Promise<{
     success: boolean;
@@ -75,17 +80,7 @@ class DefaultExecutor implements TradeExecutor {
 
   async execute(
     mode: ExecutionMode,
-    plan: {
-      opportunityId: string;
-      strategyId: string;
-      pair: string;
-      buyDex: string;
-      sellDex: string;
-      buyPrice: number;
-      sellPrice: number;
-      notionalUsd: number;
-      metadata?: Record<string, unknown>;
-    },
+    plan: ExecutionPlanInput,
     simulation: SimulationResult,
   ) {
     if (mode === "paper") {
@@ -222,6 +217,184 @@ export class AlphaEngine {
     };
   }
 
+  async executeApprovedCandidate(
+    candidate: DiscoveryCandidate,
+    requestedMode: ExecutionMode,
+  ): Promise<Omit<DiscoveryApproveResult, "approved" | "sessionId" | "candidateId" | "mode">> {
+    const effectiveMode: ExecutionMode =
+      requestedMode === "live" && this.options.liveEnabled && this.evaluateLiveGate().passed ? "live" : "paper";
+    const degradedToPaper = requestedMode === "live" && effectiveMode === "paper";
+
+    const quotes = this.filterFreshQuotes(await this.marketWatch.fetch(candidate.pair, [candidate.buyDex, candidate.sellDex]));
+    const buyQuote = quotes.find((quote) => quote.dex === candidate.buyDex && quote.pair === candidate.pair);
+    const sellQuote = quotes.find((quote) => quote.dex === candidate.sellDex && quote.pair === candidate.pair);
+
+    if (!buyQuote || !sellQuote || buyQuote.ask <= 0 || sellQuote.bid <= 0) {
+      throw new Error(`missing fresh quotes for candidate ${candidate.id}`);
+    }
+
+    const balance = this.store.getCurrentBalance(effectiveMode);
+    const maxNotional = this.riskEngine.maxNotional(balance);
+    const candidateNotional = asNumber(candidate.input?.notionalUsd);
+    const desiredNotional = candidateNotional ?? maxNotional;
+    const boundedNotional = Math.max(0, Math.min(desiredNotional, maxNotional));
+    if (boundedNotional <= 0) {
+      throw new Error(`risk policy blocked execution for candidate ${candidate.id}`);
+    }
+
+    const grossEdgeBps = ((sellQuote.bid - buyQuote.ask) / buyQuote.ask) * 10_000;
+    const opportunity: Opportunity = {
+      id: crypto.randomUUID(),
+      strategyId: candidate.strategyId,
+      pair: candidate.pair,
+      buyDex: candidate.buyDex,
+      sellDex: candidate.sellDex,
+      buyPrice: buyQuote.ask,
+      sellPrice: sellQuote.bid,
+      grossEdgeBps,
+      detectedAt: new Date().toISOString(),
+      metadata: {
+        ...(candidate.input ?? {}),
+        source: "discovery-approval",
+        discoveryCandidateId: candidate.id,
+        discoverySessionId: candidate.sessionId,
+        confidence: candidate.confidence,
+        reason: candidate.reason,
+        gasBuyUsd: buyQuote.gasUsd,
+        gasSellUsd: sellQuote.gasUsd,
+      },
+    };
+
+    this.store.insertOpportunity(
+      opportunity,
+      Math.max(0, buyQuote.gasUsd) + Math.max(0, sellQuote.gasUsd),
+      candidate.expectedNetUsd,
+      "detected",
+    );
+
+    const plan = {
+      opportunityId: opportunity.id,
+      strategyId: candidate.strategyId,
+      pair: candidate.pair,
+      buyDex: candidate.buyDex,
+      sellDex: candidate.sellDex,
+      buyPrice: buyQuote.ask,
+      sellPrice: sellQuote.bid,
+      notionalUsd: boundedNotional,
+      metadata: opportunity.metadata,
+    };
+
+    const simulation = this.simulator.estimate(plan, effectiveMode, this.options.riskPolicy);
+    this.recordSimulationOutcome(opportunity.id, effectiveMode, plan, simulation);
+
+    if (!simulation.pass) {
+      return {
+        effectiveMode,
+        opportunityId: opportunity.id,
+        simulation,
+        tradeResult: {
+          success: false,
+          txHash: "",
+          status: "failed",
+          grossUsd: simulation.grossUsd,
+          feeUsd: simulation.feeUsd,
+          netUsd: simulation.netUsd,
+          error: simulation.reason,
+          errorType: "validation",
+        },
+        degradedToPaper,
+      };
+    }
+
+    const trade = await this.executor.execute(effectiveMode, plan, simulation);
+    const tradeForStore = this.toTradeForStore(trade, simulation, plan.notionalUsd);
+
+    if (this.shouldDegradeToPaper(effectiveMode, trade)) {
+      const degraded = await this.handleLivePermissionDegrade(
+        candidate.strategyId,
+        opportunity,
+        plan,
+        simulation,
+        trade.errorType,
+        trade.error,
+      );
+      return {
+        effectiveMode: "paper",
+        opportunityId: opportunity.id,
+        simulation,
+        tradeResult: degraded.trade,
+        degradedToPaper: true,
+        tradeId: degraded.tradeId,
+      };
+    }
+
+    const stored = await this.handleTradeResult(
+      candidate.strategyId,
+      opportunity,
+      effectiveMode,
+      trade,
+      tradeForStore,
+    );
+    return {
+      effectiveMode,
+      opportunityId: opportunity.id,
+      simulation,
+      tradeResult: trade,
+      degradedToPaper,
+      tradeId: stored.tradeId,
+    };
+  }
+
+  private recordSimulationOutcome(
+    opportunityId: string,
+    mode: ExecutionMode,
+    plan: ExecutionPlanInput,
+    simulation: SimulationResult,
+  ): void {
+    this.store.insertSimulation({
+      opportunityId,
+      mode,
+      inputJson: JSON.stringify(plan),
+      resultJson: JSON.stringify(simulation),
+      createdAt: new Date().toISOString(),
+    });
+    this.store.updateOpportunityEstimate(
+      opportunityId,
+      simulation.feeUsd,
+      simulation.netUsd,
+      simulation.pass ? "planned" : "rejected",
+    );
+  }
+
+  private toTradeForStore(
+    trade: TradeResult,
+    simulation: SimulationResult,
+    notionalUsd: number,
+  ): TradeResult {
+    const computedDeviation = this.estimateSlippageDeviationBps(
+      trade.success,
+      simulation.netUsd,
+      trade.netUsd,
+      notionalUsd,
+    );
+    return {
+      ...trade,
+      slippageDeviationBps: trade.slippageDeviationBps ?? computedDeviation,
+    };
+  }
+
+  private estimateSlippageDeviationBps(
+    tradeSuccess: boolean,
+    simulatedNetUsd: number,
+    actualNetUsd: number,
+    notionalUsd: number,
+  ): number | undefined {
+    if (!tradeSuccess || notionalUsd <= 0) {
+      return undefined;
+    }
+    return Math.abs(simulatedNetUsd - actualNetUsd) / notionalUsd * 10_000;
+  }
+
   private async tick(): Promise<void> {
     if (this.running) {
       return;
@@ -319,21 +492,7 @@ export class AlphaEngine {
     }
 
     const simulation = this.simulator.estimate(plan, this.mode, localRiskPolicy);
-
-    this.store.insertSimulation({
-      opportunityId: opportunity.id,
-      mode: this.mode,
-      inputJson: JSON.stringify(plan),
-      resultJson: JSON.stringify(simulation),
-      createdAt: new Date().toISOString(),
-    });
-
-    this.store.updateOpportunityEstimate(
-      opportunity.id,
-      simulation.feeUsd,
-      simulation.netUsd,
-      simulation.pass ? "planned" : "rejected",
-    );
+    this.recordSimulationOutcome(opportunity.id, this.mode, plan, simulation);
 
     if (!simulation.pass) {
       return;
@@ -350,21 +509,14 @@ export class AlphaEngine {
     });
 
     const trade = await this.executor.execute(effectiveMode, plan, simulation);
-    const slippageDeviationBps =
-      trade.success && plan.notionalUsd > 0
-        ? Math.abs(simulation.netUsd - trade.netUsd) / plan.notionalUsd * 10_000
-        : undefined;
-    const tradeForStore = {
-      ...trade,
-      slippageDeviationBps: trade.slippageDeviationBps ?? slippageDeviationBps,
-    };
+    const tradeForStore = this.toTradeForStore(trade, simulation, plan.notionalUsd);
 
     if (this.shouldDegradeToPaper(effectiveMode, trade)) {
-      await this.handleLivePermissionDegrade(plugin, opportunity, plan, simulation, trade.errorType, trade.error);
+      await this.handleLivePermissionDegrade(plugin.id, opportunity, plan, simulation, trade.errorType, trade.error);
       return;
     }
 
-    await this.handleTradeResult(plugin, opportunity, effectiveMode, trade, tradeForStore);
+    await this.handleTradeResult(plugin.id, opportunity, effectiveMode, trade, tradeForStore);
   }
 
   private async maybePromoteToLive(): Promise<void> {
@@ -504,23 +656,13 @@ export class AlphaEngine {
   }
 
   private async handleLivePermissionDegrade(
-    plugin: StrategyPlugin,
+    strategyId: string,
     opportunity: Opportunity,
-    plan: {
-      opportunityId: string;
-      strategyId: string;
-      pair: string;
-      buyDex: string;
-      sellDex: string;
-      buyPrice: number;
-      sellPrice: number;
-      notionalUsd: number;
-      metadata?: Record<string, unknown>;
-    },
+    plan: ExecutionPlanInput,
     simulation: SimulationResult,
     errorType: TradeResult["errorType"],
     errorMessage: string | undefined,
-  ): Promise<void> {
+  ): Promise<{ trade: TradeResult; tradeId: string }> {
     this.store.updateOpportunityStatus(opportunity.id, "degraded_to_paper");
     this.store.insertAlert(
       "warn",
@@ -532,11 +674,11 @@ export class AlphaEngine {
       level: "warn",
       event: "risk_alert",
       pair: opportunity.pair,
-      strategyId: plugin.id,
+      strategyId,
     });
 
     const paperTrade = await this.executor.execute("paper", plan, simulation);
-    this.store.insertTrade(opportunity.id, "paper", paperTrade, new Date().toISOString());
+    const tradeId = this.store.insertTrade(opportunity.id, "paper", paperTrade, new Date().toISOString());
     await this.notifier.publish({
       mode: "paper",
       level: "info",
@@ -544,18 +686,22 @@ export class AlphaEngine {
       pair: opportunity.pair,
       netUsd: paperTrade.netUsd,
       txHash: paperTrade.txHash,
-      strategyId: plugin.id,
+      strategyId,
     });
+    return {
+      trade: paperTrade,
+      tradeId,
+    };
   }
 
   private async handleTradeResult(
-    plugin: StrategyPlugin,
+    strategyId: string,
     opportunity: Opportunity,
     effectiveMode: ExecutionMode,
     trade: TradeResult,
     tradeForStore: TradeResult,
-  ): Promise<void> {
-    this.store.insertTrade(opportunity.id, effectiveMode, tradeForStore, new Date().toISOString());
+  ): Promise<{ tradeId: string }> {
+    const tradeId = this.store.insertTrade(opportunity.id, effectiveMode, tradeForStore, new Date().toISOString());
 
     if (trade.success) {
       this.consecutiveFailures = 0;
@@ -567,9 +713,9 @@ export class AlphaEngine {
         pair: opportunity.pair,
         netUsd: trade.netUsd,
         txHash: trade.txHash,
-        strategyId: plugin.id,
+        strategyId,
       });
-      return;
+      return { tradeId };
     }
 
     this.consecutiveFailures += 1;
@@ -582,14 +728,15 @@ export class AlphaEngine {
       pair: opportunity.pair,
       netUsd: trade.netUsd,
       txHash: trade.txHash,
-      strategyId: plugin.id,
+      strategyId,
     });
 
-    await this.maybeTriggerCircuitBreaker(plugin, opportunity, effectiveMode);
+    await this.maybeTriggerCircuitBreaker(strategyId, opportunity, effectiveMode);
+    return { tradeId };
   }
 
   private async maybeTriggerCircuitBreaker(
-    plugin: StrategyPlugin,
+    strategyId: string,
     opportunity: Opportunity,
     effectiveMode: ExecutionMode,
   ): Promise<void> {
@@ -617,7 +764,7 @@ export class AlphaEngine {
       level: "error",
       event: "risk_alert",
       pair: opportunity.pair,
-      strategyId: plugin.id,
+      strategyId,
     });
   }
 

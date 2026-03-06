@@ -162,7 +162,7 @@ describe("API server", () => {
       id: "alphaos",
       version: "0.2.0",
       description: "test",
-      strategyIds: ["dex-arbitrage", "smart-money-mirror"],
+      strategyIds: ["dex-arbitrage"],
     };
 
     const onchainClient = new OnchainOsClient({
@@ -183,40 +183,17 @@ describe("API server", () => {
       demoPublic: false,
     });
 
-    const createUnauthorized = await invokeApi(app, "POST", "/api/v1/signals/whale", {
-      wallet: "0xabc",
-      token: "ETH",
-      side: "buy",
-      sizeUsd: 100000,
-      confidence: 0.91,
-    });
-    expect(createUnauthorized.status).toBe(401);
+    const metricsUnauthorized = await invokeApi(app, "GET", "/api/v1/metrics/today");
+    expect(metricsUnauthorized.status).toBe(401);
 
-    const createResp = await invokeApi(
-      app,
-      "POST",
-      "/api/v1/signals/whale",
-      {
-        wallet: "0xabc",
-        token: "ETH",
-        side: "buy",
-        sizeUsd: 100000,
-        confidence: 0.91,
-      },
-      { headers: authHeaders() },
-    );
-
-    expect(createResp.status).toBe(202);
-
-    const listResp = await invokeApi(
+    const metricsAuthorized = await invokeApi(
       app,
       "GET",
-      "/api/v1/signals/whale?status=pending",
+      "/api/v1/metrics/today",
       undefined,
       { headers: authHeaders() },
     );
-    expect(listResp.status).toBe(200);
-    expect((listResp.body as { items: unknown[] }).items.length).toBe(1);
+    expect(metricsAuthorized.status).toBe(200);
 
     const shareResp = await invokeApi(
       app,
@@ -249,7 +226,7 @@ describe("API server", () => {
       id: "alphaos",
       version: "0.2.0",
       description: "test",
-      strategyIds: ["dex-arbitrage", "smart-money-mirror"],
+      strategyIds: ["dex-arbitrage"],
     };
 
     const onchainClient = new OnchainOsClient({
@@ -326,7 +303,7 @@ describe("API server", () => {
       id: "alphaos",
       version: "0.2.0",
       description: "test",
-      strategyIds: ["dex-arbitrage", "smart-money-mirror"],
+      strategyIds: ["dex-arbitrage"],
     };
 
     store.insertOpportunity(
@@ -390,6 +367,7 @@ describe("API server", () => {
     expect(demoPage.headers["content-type"]).toContain("text/html");
     expect(demoPage.text).toContain("official-status");
     expect(demoPage.text).toContain("OnchainOS v6 Probe");
+    expect(demoPage.text).toContain("Growth Moments");
     expect(demoPage.text).toContain("/api/v1/integration/onchainos/probe");
     expect(demoPage.text).toContain("可用");
     expect(demoPage.text).toContain("受限");
@@ -492,6 +470,128 @@ describe("API server", () => {
     );
     expect(tokenCache.status).toBe(200);
     expect((tokenCache.body as { items: unknown[] }).items.length).toBe(1);
+
+    const moments = await invokeApi(
+      app,
+      "GET",
+      "/api/v1/growth/moments?limit=5",
+      undefined,
+      { headers: authHeaders() },
+    );
+    expect(moments.status).toBe(200);
+    expect((moments.body as { items: Array<{ category?: string; text?: string }> }).items.length).toBeGreaterThan(0);
+    expect(
+      (moments.body as { items: Array<{ category?: string }> }).items.some(
+        (item) => item.category === "summary" || item.category === "trade",
+      ),
+    ).toBe(true);
+
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("serves agent-comm status, message query, and trusted peer upsert endpoints", async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "alphaos-api-"));
+    const store = new StateStore(tempDir);
+    stores.push(store);
+
+    const engine = {
+      getCurrentMode: () => "paper",
+      requestMode: (mode: "paper" | "live"): EngineModeResponse => ({
+        ok: true,
+        requestedMode: mode,
+        currentMode: mode,
+        reasons: [],
+      }),
+    };
+
+    const manifest: SkillManifest = {
+      id: "alphaos",
+      version: "0.2.0",
+      description: "test",
+      strategyIds: ["dex-arbitrage"],
+    };
+
+    store.upsertAgentPeer({
+      peerId: "peer-existing",
+      walletAddress: "0x9999999999999999999999999999999999999999",
+      pubkey: "03aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      status: "trusted",
+      capabilities: ["ping"],
+    });
+    store.insertAgentMessage({
+      id: "msg-existing",
+      direction: "inbound",
+      peerId: "peer-existing",
+      nonce: "nonce-existing",
+      commandType: "ping",
+      ciphertext: "0xdeadbeef",
+      status: "executed",
+      receivedAt: new Date().toISOString(),
+      executedAt: new Date().toISOString(),
+    });
+
+    const app = createServer(engine as never, store, manifest, {
+      apiSecret: TEST_API_SECRET,
+      demoPublic: false,
+      agentCommRuntime: {
+        stop: () => undefined,
+        getSnapshot: () => ({
+          enabled: true,
+          chainId: 196,
+          listenerMode: "poll",
+          walletAlias: "agent-comm",
+          localAddress: "0x1111111111111111111111111111111111111111",
+          localPubkey: "03bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        }),
+      },
+    });
+
+    const statusResp = await invokeApi(
+      app,
+      "GET",
+      "/api/v1/agent-comm/status",
+      undefined,
+      { headers: authHeaders() },
+    );
+    expect(statusResp.status).toBe(200);
+    expect((statusResp.body as { snapshot: { enabled: boolean } }).snapshot.enabled).toBe(true);
+    expect((statusResp.body as { trustedPeerCount: number }).trustedPeerCount).toBe(1);
+
+    const messagesResp = await invokeApi(
+      app,
+      "GET",
+      "/api/v1/agent-comm/messages?direction=inbound&status=executed",
+      undefined,
+      { headers: authHeaders() },
+    );
+    expect(messagesResp.status).toBe(200);
+    expect((messagesResp.body as { items: unknown[] }).items).toHaveLength(1);
+
+    const peersUpsert = await invokeApi(
+      app,
+      "POST",
+      "/api/v1/agent-comm/peers/trusted",
+      {
+        peerId: "peer-new",
+        walletAddress: "0x7777777777777777777777777777777777777777",
+        pubkey: "03cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        capabilities: ["ping", "start_discovery"],
+      },
+      { headers: authHeaders() },
+    );
+    expect(peersUpsert.status).toBe(200);
+    expect((peersUpsert.body as { peerId: string }).peerId).toBe("peer-new");
+    expect((peersUpsert.body as { status: string }).status).toBe("trusted");
+
+    const peersResp = await invokeApi(
+      app,
+      "GET",
+      "/api/v1/agent-comm/peers?status=trusted",
+      undefined,
+      { headers: authHeaders() },
+    );
+    expect(peersResp.status).toBe(200);
+    expect((peersResp.body as { items: unknown[] }).items.length).toBeGreaterThanOrEqual(2);
 
     fs.rmSync(tempDir, { recursive: true, force: true });
   });

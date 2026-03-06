@@ -4,7 +4,19 @@ import type { AlphaEngine } from "../engine/alpha-engine";
 import { OnchainOsClient } from "../runtime/onchainos-client";
 import { StateStore } from "../runtime/state-store";
 import { SandboxReplayService } from "../runtime/sandbox-replay";
+import { DiscoveryEngine } from "../runtime/discovery/discovery-engine";
 import type { BacktestSnapshotRow, RiskPolicy, SkillManifest } from "../types";
+import type { AgentCommRuntimeHandle } from "../runtime/agent-comm/runtime";
+import {
+  agentCommandTypes,
+  agentMessageDirections,
+  agentMessageStatuses,
+  agentPeerStatuses,
+  type AgentMessageDirection,
+  type AgentMessageStatus,
+  type AgentPeerCapability,
+  type AgentPeerStatus,
+} from "../runtime/agent-comm/types";
 
 function toLimit(input: unknown, fallback: number): number {
   const parsed = Number(input ?? fallback);
@@ -68,6 +80,162 @@ function parseBoolean(input: unknown, fallback: boolean): boolean {
     return fallback;
   }
   return ["1", "true", "yes", "on"].includes(input.toLowerCase());
+}
+
+function isAllowedValue<T extends string>(value: string, allowed: readonly T[]): value is T {
+  return allowed.includes(value as T);
+}
+
+function readTrimmedString(input: unknown): string {
+  return typeof input === "string" ? input.trim() : "";
+}
+
+function readOptionalTrimmedString(input: unknown): string | undefined {
+  const value = readTrimmedString(input);
+  return value || undefined;
+}
+
+function parseOptionalAllowedValue<T extends string>(
+  input: unknown,
+  allowed: readonly T[],
+): { raw: string; value?: T } {
+  const raw = readTrimmedString(input);
+  if (!raw) {
+    return { raw };
+  }
+  return {
+    raw,
+    value: isAllowedValue(raw, allowed) ? raw : undefined,
+  };
+}
+
+function createAgentCommStatusResponse(store: StateStore, runtime: AgentCommRuntimeHandle) {
+  const snapshot = runtime.getSnapshot();
+  return {
+    snapshot,
+    trustedPeerCount: store.listAgentPeers(1000, "trusted").length,
+    recentMessageCount: store.listAgentMessages(20).length,
+  };
+}
+
+function parseAgentMessageListQuery(
+  query: express.Request["query"],
+):
+  | {
+      ok: true;
+      limit: number;
+      filters: {
+        peerId?: string;
+        direction?: AgentMessageDirection;
+        status?: AgentMessageStatus;
+      };
+    }
+  | { ok: false; error: string } {
+  const direction = parseOptionalAllowedValue(query.direction, agentMessageDirections);
+  if (direction.raw && !direction.value) {
+    return { ok: false, error: "invalid direction" };
+  }
+
+  const status = parseOptionalAllowedValue(query.status, agentMessageStatuses);
+  if (status.raw && !status.value) {
+    return { ok: false, error: "invalid status" };
+  }
+
+  return {
+    ok: true,
+    limit: toLimit(query.limit, 50),
+    filters: {
+      peerId: readOptionalTrimmedString(query.peerId),
+      direction: direction.value,
+      status: status.value,
+    },
+  };
+}
+
+function parseAgentPeerListQuery(
+  query: express.Request["query"],
+): { ok: true; limit: number; status?: AgentPeerStatus } | { ok: false; error: string } {
+  const status = parseOptionalAllowedValue(query.status, agentPeerStatuses);
+  if (status.raw && !status.value) {
+    return { ok: false, error: "invalid peer status" };
+  }
+
+  return {
+    ok: true,
+    limit: toLimit(query.limit, 100),
+    status: status.value,
+  };
+}
+
+function parseAgentPeerCapabilities(input: unknown): AgentPeerCapability[] {
+  if (!Array.isArray(input)) {
+    return [];
+  }
+
+  return input
+    .map((item) => String(item ?? "").trim())
+    .filter(
+      (item): item is AgentPeerCapability => item.length > 0 && isAllowedValue(item, agentCommandTypes),
+    );
+}
+
+function parseTrustedPeerUpsertBody(
+  body: unknown,
+):
+  | { ok: true; input: Parameters<StateStore["upsertAgentPeer"]>[0] }
+  | { ok: false; error: string } {
+  const payload = body && typeof body === "object" ? (body as Record<string, unknown>) : {};
+  const peerId = readTrimmedString(payload.peerId);
+  const walletAddress = readTrimmedString(payload.walletAddress);
+  const pubkey = readTrimmedString(payload.pubkey);
+
+  if (!peerId || !walletAddress || !pubkey) {
+    return {
+      ok: false,
+      error: "peerId, walletAddress, pubkey are required",
+    };
+  }
+
+  return {
+    ok: true,
+    input: {
+      peerId,
+      walletAddress,
+      pubkey,
+      name: readOptionalTrimmedString(payload.name),
+      status: "trusted",
+      capabilities: parseAgentPeerCapabilities(payload.capabilities),
+      metadata:
+        payload.metadata && typeof payload.metadata === "object" && !Array.isArray(payload.metadata)
+          ? (payload.metadata as Record<string, unknown>)
+          : undefined,
+    },
+  };
+}
+
+function isDiscoveryStrategyId(input: string): input is "spread-threshold" | "mean-reversion" | "volatility-breakout" {
+  return input === "spread-threshold" || input === "mean-reversion" || input === "volatility-breakout";
+}
+
+function normalizeDiscoveryPairs(input: unknown): string[] | null {
+  if (!Array.isArray(input)) {
+    return null;
+  }
+  const pairs = input
+    .map((pair) => String(pair ?? "").trim().toUpperCase())
+    .filter((pair) => pair.length > 0);
+  return pairs.length > 0 ? pairs : null;
+}
+
+function parseOptionalPositiveNumber(input: unknown): { ok: true; value?: number } | { ok: false } {
+  if (input === undefined) {
+    return { ok: true };
+  }
+  const parsed = Number(input);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return { ok: false };
+  }
+  return { ok: true, value: parsed };
 }
 
 function secureEquals(left: string, right: string): boolean {
@@ -171,6 +339,10 @@ function demoHtml(): string {
       <pre id="share">No successful trade yet</pre>
     </div>
     <div class="card">
+      <h2>Growth Moments</h2>
+      <pre id="moments">No growth moments yet</pre>
+    </div>
+    <div class="card">
       <h2>OnchainOS v6 Probe</h2>
       <pre id="probe">Probe pending...</pre>
     </div>
@@ -190,6 +362,7 @@ function demoHtml(): string {
       officialHint: document.getElementById("official-hint"),
       strategies: document.getElementById("strategies"),
       share: document.getElementById("share"),
+      moments: document.getElementById("moments"),
       probe: document.getElementById("probe"),
       feed: document.getElementById("feed"),
     };
@@ -319,6 +492,10 @@ function demoHtml(): string {
       if (data.share) {
         el.share.textContent = data.share.text;
       }
+      if (Array.isArray(data.moments) && data.moments.length > 0) {
+        const lines = data.moments.map((m) => "- " + String(m.title || "moment") + "\\n  " + String(m.text || ""));
+        el.moments.textContent = lines.join("\\n");
+      }
 
       const line = "[" + new Date().toISOString() + "] net=" + Number(data.metrics.netUsd || 0).toFixed(2) + " trades=" + data.metrics.trades + " mode=" + data.mode;
       el.feed.textContent = (line + "\n" + el.feed.textContent).slice(0, 6000);
@@ -335,8 +512,10 @@ export function createServer(
   options?: {
     defaultRiskPolicy?: RiskPolicy;
     onchainClient?: OnchainOsClient;
+    discoveryEngine?: DiscoveryEngine;
     apiSecret?: string;
     demoPublic?: boolean;
+    agentCommRuntime?: AgentCommRuntimeHandle;
   },
 ) {
   const app = express();
@@ -433,6 +612,7 @@ export function createServer(
         metrics: store.getTodayMetrics(),
         strategies: store.listStrategyStatusToday(),
         share: store.getLatestShareCard(),
+        moments: store.listGrowthMoments(3),
       };
       res.write(`data: ${JSON.stringify(payload)}\n\n`);
     };
@@ -447,6 +627,50 @@ export function createServer(
 
   app.use("/api/v1", requireApiAuth);
 
+  const respondDiscoveryUnavailable = (res: express.Response) => {
+    res.status(503).json({ error: "discovery engine unavailable" });
+  };
+
+  const ensureDiscoveryEngine = (res: express.Response): DiscoveryEngine | null => {
+    const discovery = options?.discoveryEngine;
+    if (!discovery) {
+      respondDiscoveryUnavailable(res);
+      return null;
+    }
+    return discovery;
+  };
+
+  const loadDiscoverySession = (res: express.Response, sessionIdParam: unknown) => {
+    const discovery = ensureDiscoveryEngine(res);
+    if (!discovery) {
+      return null;
+    }
+    const sessionId = String(sessionIdParam ?? "").trim();
+    const session = discovery.getSession(sessionId);
+    if (!session) {
+      res.status(404).json({ error: "session not found" });
+      return null;
+    }
+    return { discovery, sessionId, session };
+  };
+
+  const handleDiscoveryError = (res: express.Response, error: unknown) => {
+    const code = DiscoveryEngine.errorCode(error);
+    if (code === "invalid_strategy" || code === "invalid_pairs") {
+      res.status(400).json({ error: String(error), code });
+      return;
+    }
+    if (code === "session_conflict" || code === "session_active" || code === "candidate_not_pending") {
+      res.status(409).json({ error: String(error), code });
+      return;
+    }
+    if (code === "not_found" || code === "candidate_not_found") {
+      res.status(404).json({ error: String(error), code });
+      return;
+    }
+    res.status(500).json({ error: "discovery_internal_error", detail: String(error), code });
+  };
+
   app.post("/api/v1/engine/mode", (req, res) => {
     const mode = req.body?.mode;
     if (mode !== "paper" && mode !== "live") {
@@ -455,6 +679,134 @@ export function createServer(
     }
     const result = engine.requestMode(mode);
     res.status(result.ok ? 200 : 409).json(result);
+  });
+
+  app.post("/api/v1/discovery/sessions/start", async (req, res) => {
+    const discovery = ensureDiscoveryEngine(res);
+    if (!discovery) {
+      return;
+    }
+
+    const strategyId = String(req.body?.strategyId ?? "").trim();
+    if (!isDiscoveryStrategyId(strategyId)) {
+      res.status(400).json({ error: "strategyId must be spread-threshold | mean-reversion | volatility-breakout" });
+      return;
+    }
+
+    const pairs = normalizeDiscoveryPairs(req.body?.pairs);
+    if (!pairs) {
+      res.status(400).json({ error: "pairs must be a non-empty string array" });
+      return;
+    }
+    const duration = parseOptionalPositiveNumber(req.body?.durationMinutes);
+    if (!duration.ok) {
+      res.status(400).json({ error: "durationMinutes must be a positive number" });
+      return;
+    }
+    const sampleInterval = parseOptionalPositiveNumber(req.body?.sampleIntervalSec);
+    if (!sampleInterval.ok) {
+      res.status(400).json({ error: "sampleIntervalSec must be a positive number" });
+      return;
+    }
+    const topN = parseOptionalPositiveNumber(req.body?.topN);
+    if (!topN.ok) {
+      res.status(400).json({ error: "topN must be a positive number" });
+      return;
+    }
+
+    try {
+      const session = await discovery.startSession({
+        strategyId,
+        pairs,
+        durationMinutes: duration.value,
+        sampleIntervalSec: sampleInterval.value,
+        topN: topN.value,
+      });
+      res.json({
+        sessionId: session.id,
+        status: session.status,
+        startedAt: session.startedAt,
+        plannedEndAt: session.plannedEndAt,
+      });
+    } catch (error) {
+      handleDiscoveryError(res, error);
+    }
+  });
+
+  app.get("/api/v1/discovery/sessions/active", (_req, res) => {
+    const discovery = ensureDiscoveryEngine(res);
+    if (!discovery) {
+      return;
+    }
+    res.json(discovery.getActiveSession());
+  });
+
+  app.get("/api/v1/discovery/sessions/:sessionId", (req, res) => {
+    const context = loadDiscoverySession(res, req.params.sessionId);
+    if (!context) {
+      return;
+    }
+    res.json(context.session);
+  });
+
+  app.get("/api/v1/discovery/sessions/:sessionId/candidates", (req, res) => {
+    const context = loadDiscoverySession(res, req.params.sessionId);
+    if (!context) {
+      return;
+    }
+    const limit = toLimit(req.query.limit, 50);
+    res.json({ items: context.discovery.listCandidates(context.sessionId, limit) });
+  });
+
+  app.get("/api/v1/discovery/sessions/:sessionId/report", (req, res) => {
+    const context = loadDiscoverySession(res, req.params.sessionId);
+    if (!context) {
+      return;
+    }
+    const report = context.discovery.getReport(context.sessionId);
+    if (!report) {
+      res.status(404).json({ error: "report not ready" });
+      return;
+    }
+    res.json(report);
+  });
+
+  app.post("/api/v1/discovery/sessions/:sessionId/stop", async (req, res) => {
+    const discovery = ensureDiscoveryEngine(res);
+    if (!discovery) {
+      return;
+    }
+    const sessionId = String(req.params.sessionId ?? "").trim();
+    try {
+      const session = await discovery.stopSession(sessionId);
+      res.json(session);
+    } catch (error) {
+      handleDiscoveryError(res, error);
+    }
+  });
+
+  app.post("/api/v1/discovery/sessions/:sessionId/approve", async (req, res) => {
+    const discovery = ensureDiscoveryEngine(res);
+    if (!discovery) {
+      return;
+    }
+    const sessionId = String(req.params.sessionId ?? "").trim();
+    const candidateId = String(req.body?.candidateId ?? "").trim();
+    if (!candidateId) {
+      res.status(400).json({ error: "candidateId is required" });
+      return;
+    }
+    const mode = req.body?.mode === "live" ? "live" : "paper";
+    if (req.body?.mode !== undefined && req.body?.mode !== "paper" && req.body?.mode !== "live") {
+      res.status(400).json({ error: "mode must be paper or live" });
+      return;
+    }
+    try {
+      const result = await discovery.approveCandidate(sessionId, candidateId, mode);
+      res.json(result);
+    } catch (error) {
+      handleDiscoveryError(res, error);
+    }
   });
 
   app.get("/api/v1/metrics/today", (_req, res) => {
@@ -507,6 +859,11 @@ export function createServer(
     res.json(card);
   });
 
+  app.get("/api/v1/growth/moments", (req, res) => {
+    const limit = toLimit(req.query.limit, 5);
+    res.json({ items: store.listGrowthMoments(limit) });
+  });
+
   app.get("/api/v1/backtest/snapshot", (req, res) => {
     const hours = toHours(req.query.hours, 24);
     const format = String(req.query.format ?? "json");
@@ -520,6 +877,49 @@ export function createServer(
     }
 
     res.json({ hours, generatedAt: new Date().toISOString(), rows });
+  });
+
+  app.get("/api/v1/agent-comm/status", (_req, res) => {
+    const runtime = options?.agentCommRuntime;
+    if (!runtime) {
+      res.status(503).json({ error: "agent-comm runtime unavailable" });
+      return;
+    }
+
+    res.json(createAgentCommStatusResponse(store, runtime));
+  });
+
+  app.get("/api/v1/agent-comm/messages", (req, res) => {
+    const parsed = parseAgentMessageListQuery(req.query);
+    if (!parsed.ok) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+
+    res.json({
+      items: store.listAgentMessages(parsed.limit, parsed.filters),
+    });
+  });
+
+  app.get("/api/v1/agent-comm/peers", (req, res) => {
+    const parsed = parseAgentPeerListQuery(req.query);
+    if (!parsed.ok) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+
+    res.json({ items: store.listAgentPeers(parsed.limit, parsed.status) });
+  });
+
+  app.post("/api/v1/agent-comm/peers/trusted", (req, res) => {
+    const parsed = parseTrustedPeerUpsertBody(req.body);
+    if (!parsed.ok) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+
+    const peer = store.upsertAgentPeer(parsed.input);
+    res.json(peer);
   });
 
   app.post("/api/v1/replay/sandbox", (req, res) => {
@@ -539,56 +939,6 @@ export function createServer(
       minEdgeBpsOverride,
     });
     res.json(result);
-  });
-
-  app.post("/api/v1/signals/whale", (req, res) => {
-    const wallet = String(req.body?.wallet ?? "").trim();
-    const token = String(req.body?.token ?? "").trim();
-    const side = req.body?.side;
-    const sizeUsd = Number(req.body?.sizeUsd);
-    const confidence = Number(req.body?.confidence);
-    const sourceTxHash = req.body?.sourceTxHash ? String(req.body.sourceTxHash) : undefined;
-
-    if (!wallet || !token || (side !== "buy" && side !== "sell")) {
-      res.status(400).json({ error: "wallet, token, side are required" });
-      return;
-    }
-
-    if (
-      !Number.isFinite(sizeUsd) ||
-      sizeUsd <= 0 ||
-      !Number.isFinite(confidence) ||
-      confidence < 0 ||
-      confidence > 1
-    ) {
-      res.status(400).json({ error: "sizeUsd must be > 0 and confidence must be in [0,1]" });
-      return;
-    }
-
-    const id = store.insertWhaleSignal({
-      wallet,
-      token,
-      side,
-      sizeUsd,
-      confidence,
-      sourceTxHash,
-    });
-
-    res.status(202).json({ accepted: true, signalId: id });
-  });
-
-  app.get("/api/v1/signals/whale", (req, res) => {
-    const rawStatus = String(req.query.status ?? "all");
-    const status =
-      rawStatus === "pending" ||
-      rawStatus === "processing" ||
-      rawStatus === "consumed" ||
-      rawStatus === "ignored" ||
-      rawStatus === "all"
-        ? rawStatus
-        : "all";
-    const limit = toLimit(req.query.limit, 50);
-    res.json({ items: store.listWhaleSignals(status, limit) });
   });
 
   return app;
