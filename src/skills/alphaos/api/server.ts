@@ -1,11 +1,17 @@
 import express from "express";
 import crypto from "node:crypto";
+import { ZodError } from "zod";
 import type { AlphaEngine } from "../engine/alpha-engine";
 import { OnchainOsClient } from "../runtime/onchainos-client";
 import { StateStore } from "../runtime/state-store";
 import { SandboxReplayService } from "../runtime/sandbox-replay";
 import { DiscoveryEngine } from "../runtime/discovery/discovery-engine";
 import type { BacktestSnapshotRow, RiskPolicy, SkillManifest } from "../types";
+import {
+  sendCommPing,
+  sendCommStartDiscovery,
+  type AgentCommEntrypointDependencies,
+} from "../runtime/agent-comm/entrypoints";
 import type { AgentCommRuntimeHandle } from "../runtime/agent-comm/runtime";
 import {
   agentCommandTypes,
@@ -236,6 +242,156 @@ function parseOptionalPositiveNumber(input: unknown): { ok: true; value?: number
     return { ok: false };
   }
   return { ok: true, value: parsed };
+}
+
+function parseOptionalPositiveInteger(input: unknown): { ok: true; value?: number } | { ok: false } {
+  if (input === undefined) {
+    return { ok: true };
+  }
+  const parsed = Number(input);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    return { ok: false };
+  }
+  return { ok: true, value: parsed };
+}
+
+function parseOptionalStringField(
+  payload: Record<string, unknown>,
+  key: string,
+): { ok: true; value?: string } | { ok: false; error: string } {
+  const input = payload[key];
+  if (input === undefined) {
+    return { ok: true };
+  }
+  if (typeof input !== "string") {
+    return { ok: false, error: `${key} must be a string` };
+  }
+  const value = input.trim();
+  return { ok: true, value: value || undefined };
+}
+
+function parseOptionalPairsField(
+  payload: Record<string, unknown>,
+): { ok: true; value?: string[] } | { ok: false; error: string } {
+  if (payload.pairs === undefined) {
+    return { ok: true };
+  }
+  const pairs = normalizeDiscoveryPairs(payload.pairs);
+  if (!pairs) {
+    return { ok: false, error: "pairs must be a non-empty string array" };
+  }
+  return { ok: true, value: pairs };
+}
+
+function parsePingSendBody(
+  body: unknown,
+):
+  | {
+      ok: true;
+      input: {
+        peerId: string;
+        senderPeerId?: string;
+        echo?: string;
+        note?: string;
+      };
+    }
+  | { ok: false; error: string } {
+  const payload = body && typeof body === "object" ? (body as Record<string, unknown>) : {};
+  const peerId = readTrimmedString(payload.peerId);
+  if (!peerId) {
+    return { ok: false, error: "peerId is required" };
+  }
+
+  const senderPeerId = parseOptionalStringField(payload, "senderPeerId");
+  if (!senderPeerId.ok) {
+    return senderPeerId;
+  }
+  const echo = parseOptionalStringField(payload, "echo");
+  if (!echo.ok) {
+    return echo;
+  }
+  const note = parseOptionalStringField(payload, "note");
+  if (!note.ok) {
+    return note;
+  }
+
+  return {
+    ok: true,
+    input: {
+      peerId,
+      ...(senderPeerId.value ? { senderPeerId: senderPeerId.value } : {}),
+      ...(echo.value ? { echo: echo.value } : {}),
+      ...(note.value ? { note: note.value } : {}),
+    },
+  };
+}
+
+function parseStartDiscoverySendBody(
+  body: unknown,
+):
+  | {
+      ok: true;
+      input: {
+        peerId: string;
+        senderPeerId?: string;
+        strategyId: "spread-threshold" | "mean-reversion" | "volatility-breakout";
+        pairs?: string[];
+        durationMinutes?: number;
+        sampleIntervalSec?: number;
+        topN?: number;
+      };
+    }
+  | { ok: false; error: string } {
+  const payload = body && typeof body === "object" ? (body as Record<string, unknown>) : {};
+  const peerId = readTrimmedString(payload.peerId);
+  if (!peerId) {
+    return { ok: false, error: "peerId is required" };
+  }
+
+  const strategyId = readTrimmedString(payload.strategyId);
+  if (!isDiscoveryStrategyId(strategyId)) {
+    return {
+      ok: false,
+      error: "strategyId must be spread-threshold | mean-reversion | volatility-breakout",
+    };
+  }
+
+  const senderPeerId = parseOptionalStringField(payload, "senderPeerId");
+  if (!senderPeerId.ok) {
+    return senderPeerId;
+  }
+  const pairs = parseOptionalPairsField(payload);
+  if (!pairs.ok) {
+    return pairs;
+  }
+
+  const durationMinutes = parseOptionalPositiveInteger(payload.durationMinutes);
+  if (!durationMinutes.ok) {
+    return { ok: false, error: "durationMinutes must be a positive integer" };
+  }
+
+  const sampleIntervalSec = parseOptionalPositiveInteger(payload.sampleIntervalSec);
+  if (!sampleIntervalSec.ok) {
+    return { ok: false, error: "sampleIntervalSec must be a positive integer" };
+  }
+
+  const topN = parseOptionalPositiveInteger(payload.topN);
+  if (!topN.ok) {
+    return { ok: false, error: "topN must be a positive integer" };
+  }
+
+  return {
+    ok: true,
+    input: {
+      peerId,
+      strategyId,
+      ...(senderPeerId.value ? { senderPeerId: senderPeerId.value } : {}),
+      ...(pairs.value ? { pairs: pairs.value } : {}),
+      ...(durationMinutes.value ? { durationMinutes: durationMinutes.value } : {}),
+      ...(sampleIntervalSec.value ? { sampleIntervalSec: sampleIntervalSec.value } : {}),
+      ...(topN.value ? { topN: topN.value } : {}),
+    },
+  };
 }
 
 function secureEquals(left: string, right: string): boolean {
@@ -516,6 +672,7 @@ export function createServer(
     apiSecret?: string;
     demoPublic?: boolean;
     agentCommRuntime?: AgentCommRuntimeHandle;
+    agentCommSendDeps?: Pick<AgentCommEntrypointDependencies, "config" | "vault">;
   },
 ) {
   const app = express();
@@ -669,6 +826,48 @@ export function createServer(
       return;
     }
     res.status(500).json({ error: "discovery_internal_error", detail: String(error), code });
+  };
+
+  const ensureAgentCommSendDeps = (
+    res: express.Response,
+  ): AgentCommEntrypointDependencies | null => {
+    const sendDeps = options?.agentCommSendDeps;
+    if (!sendDeps) {
+      res.status(503).json({ error: "agent-comm send unavailable" });
+      return null;
+    }
+    return {
+      config: sendDeps.config,
+      store,
+      vault: sendDeps.vault,
+    };
+  };
+
+  const handleAgentCommSendError = (res: express.Response, error: unknown) => {
+    if (error instanceof ZodError) {
+      res.status(400).json({
+        error: error.issues.map((issue) => issue.message).join("; ") || "invalid request",
+      });
+      return;
+    }
+
+    const message = error instanceof Error ? error.message : String(error);
+    if (
+      message.startsWith("Trusted peer not found:") ||
+      message.startsWith("Peer is not trusted:") ||
+      message.startsWith("Invalid ")
+    ) {
+      res.status(400).json({ error: message });
+      return;
+    }
+    if (
+      message.includes("VAULT_MASTER_PASSWORD is required") ||
+      message.includes("COMM_RPC_URL is required")
+    ) {
+      res.status(503).json({ error: message });
+      return;
+    }
+    res.status(500).json({ error: "agent_comm_send_failed", detail: message });
   };
 
   app.post("/api/v1/engine/mode", (req, res) => {
@@ -920,6 +1119,44 @@ export function createServer(
 
     const peer = store.upsertAgentPeer(parsed.input);
     res.json(peer);
+  });
+
+  app.post("/api/v1/agent-comm/send/ping", async (req, res) => {
+    const deps = ensureAgentCommSendDeps(res);
+    if (!deps) {
+      return;
+    }
+
+    const parsed = parsePingSendBody(req.body);
+    if (!parsed.ok) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+
+    try {
+      res.json(await sendCommPing(deps, parsed.input));
+    } catch (error) {
+      handleAgentCommSendError(res, error);
+    }
+  });
+
+  app.post("/api/v1/agent-comm/send/start-discovery", async (req, res) => {
+    const deps = ensureAgentCommSendDeps(res);
+    if (!deps) {
+      return;
+    }
+
+    const parsed = parseStartDiscoverySendBody(req.body);
+    if (!parsed.ok) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+
+    try {
+      res.json(await sendCommStartDiscovery(deps, parsed.input));
+    } catch (error) {
+      handleAgentCommSendError(res, error);
+    }
   });
 
   app.post("/api/v1/replay/sandbox", (req, res) => {

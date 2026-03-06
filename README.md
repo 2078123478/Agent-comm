@@ -70,6 +70,10 @@ This validates `quote -> swap -> (simulate)` without broadcasting and writes int
 - `GET /api/v1/agent-comm/peers?limit=100&status=pending|trusted|blocked|revoked`
 - `POST /api/v1/agent-comm/peers/trusted`
   with `{ "peerId":"peer-a","walletAddress":"0x...","pubkey":"0x...","name":"Peer A","capabilities":["ping"] }`
+- `POST /api/v1/agent-comm/send/ping`
+  with `{ "peerId":"peer-b","senderPeerId":"agent-a","echo":"hello","note":"smoke" }`
+- `POST /api/v1/agent-comm/send/start-discovery`
+  with `{ "peerId":"peer-b","strategyId":"spread-threshold","pairs":["ETH/USDC"],"durationMinutes":30,"sampleIntervalSec":5,"topN":10,"senderPeerId":"agent-a" }`
 - `POST /api/v1/discovery/sessions/start`
   with `{ "strategyId":"spread-threshold|mean-reversion|volatility-breakout","pairs":["ETH/USDC"],"durationMinutes":30,"sampleIntervalSec":5,"topN":20 }`
 - `GET /api/v1/discovery/sessions/active`
@@ -115,11 +119,23 @@ npm run dev -- agent-comm:peer:trust peer-b 0x<peer_wallet_address> 0x<peer_pubk
 VAULT_MASTER_PASSWORD=pass123 npm run dev -- agent-comm:send ping peer-b --echo hello
 VAULT_MASTER_PASSWORD=pass123 npm run dev -- agent-comm:send start_discovery peer-b --strategy-id spread-threshold
 ```
-6. Start service with vault password when you want runtime receive/execute path:
+6. Or send through the existing HTTP server using the same Bearer auth as other `/api/v1/*` routes:
+```bash
+curl -X POST http://127.0.0.1:3000/api/v1/agent-comm/send/ping \
+  -H "Authorization: Bearer $API_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"peerId":"peer-b","echo":"hello"}'
+
+curl -X POST http://127.0.0.1:3000/api/v1/agent-comm/send/start-discovery \
+  -H "Authorization: Bearer $API_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"peerId":"peer-b","strategyId":"spread-threshold"}'
+```
+7. Start service with vault password when you want runtime receive/execute path:
 ```bash
 VAULT_MASTER_PASSWORD=pass123 npm run dev
 ```
-7. Query runtime status via `/api/v1/agent-comm/*` endpoints.
+8. Query runtime status via `/api/v1/agent-comm/*` endpoints.
 
 ## Notes
 - Business DB: `data/alpha.db`

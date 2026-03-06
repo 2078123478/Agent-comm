@@ -322,6 +322,10 @@ async function run(): Promise<void> {
     apiSecret: config.apiSecret,
     demoPublic: config.demoPublic,
     agentCommRuntime,
+    agentCommSendDeps: {
+      config,
+      vault,
+    },
   });
 
   skill.engine.start();

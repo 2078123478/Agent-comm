@@ -136,3 +136,25 @@ npm run dev -- agent-comm:send start_discovery <B的peerId> --strategy-id spread
 ```
 
 这样就不需要手动操作 vault、peer-registry、tx-sender 等底层模块了。
+
+## HTTP 发送 API
+
+服务端启动后，也可以直接走现有 HTTP API；鉴权方式和其他 `/api/v1/*` 路由一致，仍然是 Bearer token。
+
+发送 `ping`：
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/v1/agent-comm/send/ping \
+  -H "Authorization: Bearer $API_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"peerId":"peer-b","echo":"hello","note":"smoke"}'
+```
+
+发送 `start_discovery`：
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/v1/agent-comm/send/start-discovery \
+  -H "Authorization: Bearer $API_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"peerId":"peer-b","strategyId":"spread-threshold","pairs":["ETH/USDC"],"durationMinutes":30,"sampleIntervalSec":5,"topN":10}'
+```
