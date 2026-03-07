@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { loadConfig } from "../src/skills/alphaos/runtime/config";
+import { xlayerRecommendedRpcUrls } from "../src/skills/alphaos/runtime/network-profile";
 
 const originalEnv = { ...process.env };
 
@@ -8,6 +9,57 @@ afterEach(() => {
 });
 
 describe("loadConfig security defaults", () => {
+  it("applies xlayer-recommended profile defaults when env is unset", () => {
+    delete process.env.NETWORK_PROFILE;
+    delete process.env.PAIR;
+    delete process.env.ONCHAINOS_CHAIN_INDEX;
+    delete process.env.COMM_CHAIN_ID;
+    delete process.env.COMM_RPC_URL;
+    delete process.env.COMM_LISTENER_MODE;
+    delete process.env.ONCHAINOS_AUTH_MODE;
+
+    const config = loadConfig();
+    expect(config.networkProfileId).toBe("xlayer-recommended");
+    expect(config.pair).toBe("ETH/USDC");
+    expect(config.onchainChainIndex).toBe("196");
+    expect(config.commChainId).toBe(196);
+    expect(config.commRpcUrl).toBe(xlayerRecommendedRpcUrls[0]);
+    expect(config.commListenerMode).toBe("poll");
+    expect(config.onchainAuthMode).toBe("hmac");
+  });
+
+  it("lets explicit env override xlayer-recommended defaults", () => {
+    process.env.NETWORK_PROFILE = "xlayer-recommended";
+    process.env.PAIR = "OKB/USDT";
+    process.env.ONCHAINOS_CHAIN_INDEX = "8453";
+    process.env.COMM_CHAIN_ID = "8453";
+    process.env.COMM_RPC_URL = "https://rpc.base.example";
+    process.env.COMM_LISTENER_MODE = "disabled";
+    process.env.ONCHAINOS_AUTH_MODE = "bearer";
+
+    const config = loadConfig();
+    expect(config.networkProfileId).toBe("xlayer-recommended");
+    expect(config.pair).toBe("OKB/USDT");
+    expect(config.onchainChainIndex).toBe("8453");
+    expect(config.commChainId).toBe(8453);
+    expect(config.commRpcUrl).toBe("https://rpc.base.example");
+    expect(config.commListenerMode).toBe("disabled");
+    expect(config.onchainAuthMode).toBe("bearer");
+  });
+
+  it("keeps evm-custom free of xlayer transport defaults", () => {
+    process.env.NETWORK_PROFILE = "evm-custom";
+    delete process.env.COMM_RPC_URL;
+    delete process.env.COMM_LISTENER_MODE;
+    delete process.env.ONCHAINOS_AUTH_MODE;
+
+    const config = loadConfig();
+    expect(config.networkProfileId).toBe("evm-custom");
+    expect(config.commRpcUrl).toBeUndefined();
+    expect(config.commListenerMode).toBe("disabled");
+    expect(config.onchainAuthMode).toBe("bearer");
+  });
+
   it("defaults live toggles to false", () => {
     delete process.env.LIVE_ENABLED;
     delete process.env.AUTO_PROMOTE_TO_LIVE;
@@ -117,6 +169,7 @@ describe("loadConfig security defaults", () => {
   });
 
   it("rejects COMM_ENABLED without COMM_RPC_URL", () => {
+    process.env.NETWORK_PROFILE = "evm-custom";
     process.env.COMM_ENABLED = "true";
     delete process.env.COMM_RPC_URL;
 

@@ -2,6 +2,14 @@ import dotenv from "dotenv";
 import { z } from "zod";
 import type { ExecutionMode, RiskPolicy } from "../types";
 import { commListenerModeSchema, x402ModeSchema } from "./agent-comm/types";
+import {
+  type NetworkProfileId,
+  type OnchainAuthMode,
+  getNetworkProfile,
+  getPreferredCommRpcUrl,
+  networkProfileIds,
+  readNetworkProfileId,
+} from "./network-profile";
 
 dotenv.config();
 
@@ -58,8 +66,6 @@ function readJsonObject(name: string, fallback: Record<string, unknown>): Record
   }
 }
 
-type OnchainAuthMode = "bearer" | "api-key" | "hmac";
-
 function readAuthMode(name: string, fallback: OnchainAuthMode): OnchainAuthMode {
   const raw = process.env[name];
   if (raw === "bearer" || raw === "api-key" || raw === "hmac") {
@@ -85,6 +91,7 @@ function readX402Mode(name: string, fallback: z.infer<typeof x402ModeSchema>) {
 }
 
 export interface AlphaOsConfig {
+  networkProfileId: NetworkProfileId;
   port: number;
   logLevel: string;
   apiSecret?: string;
@@ -162,6 +169,7 @@ type AgentCommConfig = Pick<
   | "commPaymasterUrl"
 >;
 
+const networkProfileIdSchema: z.ZodType<NetworkProfileId> = z.enum(networkProfileIds);
 const executionModeSchema: z.ZodType<ExecutionMode> = z.enum(["paper", "live"]);
 const onchainAuthModeSchema: z.ZodType<OnchainAuthMode> = z.enum(["bearer", "api-key", "hmac"]);
 const riskPolicySchema: z.ZodType<RiskPolicy> = z
@@ -176,6 +184,7 @@ const riskPolicySchema: z.ZodType<RiskPolicy> = z
 
 export const alphaOsConfigSchema: z.ZodType<AlphaOsConfig> = z
   .object({
+    networkProfileId: networkProfileIdSchema,
     port: z.number().int().nonnegative(),
     logLevel: z.string(),
     apiSecret: z.string().optional(),
@@ -243,12 +252,25 @@ export const alphaOsConfigSchema: z.ZodType<AlphaOsConfig> = z
   })
   .strict();
 
-function readAgentCommConfig(): AgentCommConfig {
+function readAgentCommConfig(options: {
+  resolvedOnchainChainIndex: string;
+  commChainIdDefault?: number;
+  commRpcUrlDefault?: string;
+  commListenerModeDefault?: z.infer<typeof commListenerModeSchema>;
+}): AgentCommConfig {
+  const chainIdFromChainIndex = Number(options.resolvedOnchainChainIndex);
+  const commChainIdFallback = Number.isFinite(chainIdFromChainIndex)
+    ? chainIdFromChainIndex
+    : options.commChainIdDefault ?? 196;
+
   return {
     commEnabled: readBoolean("COMM_ENABLED", false),
-    commChainId: readNumber("COMM_CHAIN_ID", readNumber("ONCHAINOS_CHAIN_INDEX", 196)),
-    commRpcUrl: process.env.COMM_RPC_URL,
-    commListenerMode: readCommListenerMode("COMM_LISTENER_MODE", "disabled"),
+    commChainId: readNumber("COMM_CHAIN_ID", commChainIdFallback),
+    commRpcUrl: process.env.COMM_RPC_URL ?? options.commRpcUrlDefault,
+    commListenerMode: readCommListenerMode(
+      "COMM_LISTENER_MODE",
+      options.commListenerModeDefault ?? "disabled",
+    ),
     commPollIntervalMs: readNumber("COMM_POLL_INTERVAL_MS", 5000),
     commWalletAlias: process.env.COMM_WALLET_ALIAS ?? "agent-comm",
     commPaymasterUrl: process.env.COMM_PAYMASTER_URL,
@@ -273,13 +295,23 @@ function assertAgentCommConfig(config: AgentCommConfig): void {
 }
 
 export function loadConfig(): AlphaOsConfig {
+  const networkProfileId = readNetworkProfileId(process.env.NETWORK_PROFILE);
+  const networkProfile = getNetworkProfile(networkProfileId);
+  const resolvedOnchainChainIndex =
+    process.env.ONCHAINOS_CHAIN_INDEX ?? networkProfile.defaults.onchainChainIndex ?? "196";
+
+  // Resolution boundary:
+  // 1. defaultable fields use env -> profile defaults -> legacy fallback
+  // 2. auto-detectable fields remain in network-profile probes for later runtime checks
+  // 3. required user inputs stay explicit and are never synthesized here
   const config = {
+    networkProfileId,
     port: readNumber("PORT", 3000),
     logLevel: process.env.LOG_LEVEL ?? "info",
     apiSecret: process.env.API_SECRET,
     demoPublic: readBoolean("DEMO_PUBLIC", false),
     engineIntervalMs: readNumber("ENGINE_INTERVAL_MS", 5000),
-    pair: process.env.PAIR ?? "ETH/USDC",
+    pair: process.env.PAIR ?? networkProfile.defaults.pair ?? "ETH/USDC",
     dexes: [process.env.DEX_A ?? "okx-dex-a", process.env.DEX_B ?? "okx-dex-b"],
     startMode: readMode("START_MODE", "paper"),
     liveEnabled: readBoolean("LIVE_ENABLED", false),
@@ -290,11 +322,20 @@ export function loadConfig(): AlphaOsConfig {
     onchainOsApiSecret: process.env.ONCHAINOS_API_SECRET,
     onchainOsPassphrase: process.env.ONCHAINOS_PASSPHRASE,
     onchainOsProjectId: process.env.ONCHAINOS_PROJECT_ID,
-    onchainAuthMode: readAuthMode("ONCHAINOS_AUTH_MODE", "bearer"),
+    onchainAuthMode: readAuthMode(
+      "ONCHAINOS_AUTH_MODE",
+      networkProfile.defaults.onchainAuthMode ?? "bearer",
+    ),
     onchainApiKeyHeader: process.env.ONCHAINOS_API_KEY_HEADER ?? "X-API-Key",
-    onchainChainIndex: process.env.ONCHAINOS_CHAIN_INDEX ?? "196",
-    onchainRequireSimulate: readBoolean("ONCHAINOS_REQUIRE_SIMULATE", true),
-    onchainEnableCompatFallback: readBoolean("ONCHAINOS_ENABLE_COMPAT_FALLBACK", true),
+    onchainChainIndex: resolvedOnchainChainIndex,
+    onchainRequireSimulate: readBoolean(
+      "ONCHAINOS_REQUIRE_SIMULATE",
+      networkProfile.defaults.onchainRequireSimulate ?? true,
+    ),
+    onchainEnableCompatFallback: readBoolean(
+      "ONCHAINOS_ENABLE_COMPAT_FALLBACK",
+      networkProfile.defaults.onchainEnableCompatFallback ?? true,
+    ),
     onchainTokenCacheTtlSeconds: readNumber("ONCHAINOS_TOKEN_CACHE_TTL_SECONDS", 600),
     onchainTokenProfilePath:
       process.env.ONCHAINOS_TOKEN_PROFILE_PATH ?? "/api/v6/market/token/profile/current",
@@ -340,7 +381,12 @@ export function loadConfig(): AlphaOsConfig {
     discoveryVolRatioMin: readNumber("DISCOVERY_VOL_RATIO_MIN", 0.5),
     discoveryMinSpreadBps: readNumber("DISCOVERY_MIN_SPREAD_BPS", 20),
     discoveryNotionalUsd: readNumber("DISCOVERY_NOTIONAL_USD", 1000),
-    ...readAgentCommConfig(),
+    ...readAgentCommConfig({
+      resolvedOnchainChainIndex,
+      commChainIdDefault: networkProfile.defaults.commChainId,
+      commRpcUrlDefault: getPreferredCommRpcUrl(networkProfile),
+      commListenerModeDefault: networkProfile.defaults.commListenerMode,
+    }),
     x402Mode: readX402Mode("X402_MODE", "disabled"),
   };
   const parsed = alphaOsConfigSchema.parse(config);

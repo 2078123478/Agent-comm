@@ -2,7 +2,12 @@ import express from "express";
 import crypto from "node:crypto";
 import { ZodError } from "zod";
 import type { AlphaEngine } from "../engine/alpha-engine";
+import type { AlphaOsConfig } from "../runtime/config";
 import { OnchainOsClient } from "../runtime/onchainos-client";
+import {
+  getNetworkProfileReadinessSnapshot,
+  probeNetworkProfileReadiness,
+} from "../runtime/network-profile-probe";
 import { StateStore } from "../runtime/state-store";
 import { SandboxReplayService } from "../runtime/sandbox-replay";
 import { DiscoveryEngine } from "../runtime/discovery/discovery-engine";
@@ -666,6 +671,7 @@ export function createServer(
   store: StateStore,
   manifest: SkillManifest,
   options?: {
+    config?: AlphaOsConfig;
     defaultRiskPolicy?: RiskPolicy;
     onchainClient?: OnchainOsClient;
     discoveryEngine?: DiscoveryEngine;
@@ -705,8 +711,34 @@ export function createServer(
     maxConsecutiveFailures: 3,
   });
 
+  const getProfileSnapshot = () => {
+    if (!options?.config) {
+      return undefined;
+    }
+    return getNetworkProfileReadinessSnapshot({
+      config: options.config,
+      onchainClient: options.onchainClient,
+    });
+  };
+
   app.get("/health", (_req, res) => {
-    res.json({ ok: true, mode: engine.getCurrentMode(), service: "alphaos", strategies: manifest.strategyIds });
+    const networkProfile = getProfileSnapshot();
+    res.json({
+      ok: true,
+      mode: engine.getCurrentMode(),
+      service: "alphaos",
+      strategies: manifest.strategyIds,
+      ...(networkProfile
+        ? {
+            networkProfile: {
+              id: networkProfile.profile.id,
+              readiness: networkProfile.readiness,
+              summary: networkProfile.summary,
+              reasons: networkProfile.reasons,
+            },
+          }
+        : {}),
+    });
   });
 
   app.get("/demo", requireDemoAuthIfPrivate, (_req, res) => {
@@ -718,12 +750,48 @@ export function createServer(
     res.json(manifest);
   });
 
+  app.get("/api/v1/status", requireApiAuth, async (_req, res) => {
+    if (!options?.config) {
+      res.status(503).json({ error: "runtime config unavailable" });
+      return;
+    }
+
+    try {
+      const networkProfile = await probeNetworkProfileReadiness({
+        config: options.config,
+        onchainClient: options.onchainClient,
+      });
+
+      res.json({
+        ok: true,
+        service: "alphaos",
+        mode: engine.getCurrentMode(),
+        strategies: manifest.strategyIds,
+        networkProfile,
+        ...(options.onchainClient
+          ? {
+              onchain: options.onchainClient.getIntegrationStatus(),
+            }
+          : {}),
+      });
+    } catch (error) {
+      res.status(500).json({
+        error: "status_probe_failed",
+        detail: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
   app.get("/api/v1/integration/onchainos/status", requireApiAuth, (_req, res) => {
     if (!options?.onchainClient) {
       res.status(503).json({ error: "onchain client unavailable" });
       return;
     }
-    res.json(options.onchainClient.getIntegrationStatus());
+    const networkProfile = getProfileSnapshot();
+    res.json({
+      ...options.onchainClient.getIntegrationStatus(),
+      ...(networkProfile ? { networkProfile } : {}),
+    });
   });
 
   app.post("/api/v1/integration/onchainos/probe", requireApiAuth, async (req, res) => {

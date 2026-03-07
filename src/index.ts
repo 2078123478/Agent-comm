@@ -1,5 +1,6 @@
 import { createLogger } from "./skills/alphaos/runtime/logger";
 import { loadConfig } from "./skills/alphaos/runtime/config";
+import { getNetworkProfileReadinessSnapshot } from "./skills/alphaos/runtime/network-profile-probe";
 import { createAlphaOsSkill } from "./skills/alphaos/skill";
 import { createServer } from "./skills/alphaos/api/server";
 import { StateStore } from "./skills/alphaos/runtime/state-store";
@@ -316,6 +317,7 @@ async function run(): Promise<void> {
     vault,
   });
   const app = createServer(skill.engine, skill.store, skill.manifest, {
+    config,
     defaultRiskPolicy: config.riskPolicy,
     onchainClient: skill.onchain,
     discoveryEngine: skill.discovery,
@@ -331,7 +333,23 @@ async function run(): Promise<void> {
   skill.engine.start();
   skill.discovery.start();
   const server = app.listen(config.port, () => {
-    logger.info({ port: config.port, skill: skill.manifest.id }, "alphaos started");
+    const networkProfile = getNetworkProfileReadinessSnapshot({
+      config,
+      onchainClient: skill.onchain,
+    });
+    logger.info(
+      {
+        port: config.port,
+        skill: skill.manifest.id,
+        networkProfile: {
+          id: networkProfile.profile.id,
+          readiness: networkProfile.readiness,
+          summary: networkProfile.summary,
+          reasons: networkProfile.reasons,
+        },
+      },
+      "alphaos started",
+    );
   });
 
   const shutdown = () => {

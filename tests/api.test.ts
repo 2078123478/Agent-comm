@@ -5,16 +5,19 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import { createServer } from "../src/skills/alphaos/api/server";
+import { loadConfig } from "../src/skills/alphaos/runtime/config";
 import { OnchainOsClient } from "../src/skills/alphaos/runtime/onchainos-client";
 import { StateStore } from "../src/skills/alphaos/runtime/state-store";
 import type { EngineModeResponse, SkillManifest } from "../src/skills/alphaos/types";
 
 const stores: StateStore[] = [];
+const originalEnv = { ...process.env };
 
 afterEach(() => {
   for (const store of stores.splice(0)) {
     store.close();
   }
+  process.env = { ...originalEnv };
 });
 
 type ApiResponse = {
@@ -25,6 +28,19 @@ type ApiResponse = {
 };
 
 const TEST_API_SECRET = "unit-test-api-secret";
+
+function makeApiTestConfig(profile: "xlayer-recommended" | "evm-custom" = "evm-custom") {
+  process.env = {
+    ...originalEnv,
+    NETWORK_PROFILE: profile,
+  };
+  delete process.env.ONCHAINOS_API_BASE;
+  delete process.env.COMM_ENABLED;
+  delete process.env.COMM_RPC_URL;
+  delete process.env.COMM_CHAIN_ID;
+  delete process.env.ONCHAINOS_CHAIN_INDEX;
+  return loadConfig();
+}
 
 function authHeaders(secret = TEST_API_SECRET): Record<string, string> {
   return { authorization: `Bearer ${secret}` };
@@ -357,10 +373,20 @@ describe("API server", () => {
     });
 
     const app = createServer(engine as never, store, manifest, {
+      config: makeApiTestConfig(),
       onchainClient,
       apiSecret: TEST_API_SECRET,
       demoPublic: true,
     });
+
+    const health = await invokeApi(app, "GET", "/health");
+    expect(health.status).toBe(200);
+    expect(
+      (health.body as { networkProfile?: { id?: string; readiness?: string } }).networkProfile?.id,
+    ).toBe("evm-custom");
+    expect(
+      (health.body as { networkProfile?: { readiness?: string } }).networkProfile?.readiness,
+    ).toBe("unavailable");
 
     const demoPage = await invokeApi(app, "GET", "/demo");
     expect(demoPage.status).toBe(200);
@@ -445,6 +471,53 @@ describe("API server", () => {
     );
     expect(integrationStatus.status).toBe(200);
     expect((integrationStatus.body as { authMode: string }).authMode).toBe("bearer");
+    expect(
+      (
+        integrationStatus.body as {
+          networkProfile?: { profile?: { id?: string }; readiness?: string; reasons?: string[] };
+        }
+      ).networkProfile?.profile?.id,
+    ).toBe("evm-custom");
+    expect(
+      (
+        integrationStatus.body as {
+          networkProfile?: { readiness?: string; reasons?: string[] };
+        }
+      ).networkProfile?.readiness,
+    ).toBe("unavailable");
+    expect(
+      (
+        integrationStatus.body as {
+          networkProfile?: { reasons?: string[] };
+        }
+      ).networkProfile?.reasons?.some((reason) => reason.includes("COMM_RPC_URL")),
+    ).toBe(true);
+
+    const runtimeStatus = await invokeApi(app, "GET", "/api/v1/status", undefined, {
+      headers: authHeaders(),
+    });
+    expect(runtimeStatus.status).toBe(200);
+    expect(
+      (
+        runtimeStatus.body as {
+          networkProfile?: { profile?: { id?: string }; readiness?: string; activeProbe?: boolean };
+        }
+      ).networkProfile?.profile?.id,
+    ).toBe("evm-custom");
+    expect(
+      (
+        runtimeStatus.body as {
+          networkProfile?: { readiness?: string; activeProbe?: boolean };
+        }
+      ).networkProfile?.readiness,
+    ).toBe("unavailable");
+    expect(
+      (
+        runtimeStatus.body as {
+          networkProfile?: { activeProbe?: boolean };
+        }
+      ).networkProfile?.activeProbe,
+    ).toBe(true);
 
     const probe = await invokeApi(
       app,

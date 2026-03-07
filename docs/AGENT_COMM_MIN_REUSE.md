@@ -15,14 +15,27 @@
 
 ## 前置环境
 
-至少准备这些环境变量：
+### 方式一：X Layer 推荐路径（最快）
 
 ```bash
+export NETWORK_PROFILE_ID=xlayer-recommended
+export VAULT_MASTER_PASSWORD=pass123
+# 其他配置（COMM_CHAIN_ID=196, COMM_RPC_URL, COMM_LISTENER_MODE=poll）会自动使用默认值
+export COMM_WALLET_ALIAS=agent-comm
+```
+
+### 方式二：自定义 EVM 链
+
+```bash
+export NETWORK_PROFILE_ID=evm-custom
 export VAULT_MASTER_PASSWORD=pass123
 export COMM_CHAIN_ID=196
 export COMM_RPC_URL=https://your-rpc
+export COMM_LISTENER_MODE=poll
 export COMM_WALLET_ALIAS=agent-comm
 ```
+
+**推荐**：新手或快速演示直接用 `xlayer-recommended`，只需设置 `NETWORK_PROFILE_ID` 和 `VAULT_MASTER_PASSWORD` 即可。
 
 ## 1. 初始化 comm wallet
 

@@ -19,11 +19,40 @@ AlphaOS is implemented as a reusable skill runtime, not a loose set of services.
 - `docs/OPENCLAW_DISCOVERY_PLAYBOOK.md`: OpenClaw 双向编排接入手册（start/report/approve/hook）
 
 ## Quick Start
+
+### 方式一：X Layer 推荐路径（新手推荐）
+
 ```bash
 cp .env.example .env
+# 编辑 .env，设置 NETWORK_PROFILE_ID=xlayer-recommended（默认）
+# 只需填写 OnchainOS 凭证，其他配置会自动使用推荐默认值
 npm install
 npm run dev
 ```
+
+### 方式二：自定义 EVM 链
+
+```bash
+cp .env.example .env
+# 编辑 .env，设置 NETWORK_PROFILE_ID=evm-custom
+# 必须显式指定：ONCHAINOS_CHAIN_INDEX, COMM_CHAIN_ID, COMM_RPC_URL
+npm install
+npm run dev
+```
+
+### Network Profile 说明
+
+AlphaOS 支持两种网络配置模式：
+
+| 配置项 | `xlayer-recommended` | `evm-custom` |
+|--------|---------------------|--------------|
+| 目标链 | X Layer (chain 196) | 任意 EVM 兼容链 |
+| RPC 配置 | 自动使用推荐 RPC | 用户自行指定 |
+| 监听模式 | poll | 用户自行选择 |
+| Auth 模式 | hmac | 用户自行选择 |
+| 适用场景 | 快速启动、标准部署 | 多链部署、自定义需求 |
+
+启动后可通过 `/status` 或 `/status/probe` 端点查看当前 profile 的 readiness 状态（`ready` / `degraded` / `unavailable`）。
 
 ## One-Click Demo
 ```bash
