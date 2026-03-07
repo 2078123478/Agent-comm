@@ -22,9 +22,18 @@ import {
   AGENT_COMM_ENVELOPE_VERSION,
   agentCommandSchema,
   type AgentCommand,
+  type AgentConnectionEvent,
+  type AgentConnectionEventStatus,
+  type AgentConnectionEventType,
+  type AgentContact,
+  type AgentContactStatus,
   type AgentLocalIdentity,
   type AgentPeer,
   type AgentPeerCapability,
+  type AgentTransportEndpoint,
+  type ConnectionAcceptCommandPayload,
+  type ConnectionInviteCommandPayload,
+  type ConnectionRejectCommandPayload,
   type PingCommandPayload,
   type StartDiscoveryCommandPayload,
 } from "./types";
@@ -98,6 +107,52 @@ export interface SendCommCommandResult extends AgentCommIdentity, SendResult {
   recipient: string;
   senderPeerId: string;
   commandType: AgentCommand["type"];
+}
+
+interface ResolvedCommRecipient {
+  peerId: string;
+  walletAddress: string;
+  pubkey: string;
+}
+
+interface ResolvedOutboundContactTarget {
+  contact: AgentContact;
+  endpoint: AgentTransportEndpoint;
+  peerId: string;
+}
+
+export interface SendCommConnectionInviteOptions {
+  masterPassword?: string;
+  contactId: string;
+  senderPeerId?: string;
+  requestedProfile?: ConnectionInviteCommandPayload["requestedProfile"];
+  requestedCapabilities?: ConnectionInviteCommandPayload["requestedCapabilities"];
+  note?: ConnectionInviteCommandPayload["note"];
+}
+
+export interface SendCommConnectionAcceptOptions {
+  masterPassword?: string;
+  contactId: string;
+  senderPeerId?: string;
+  capabilityProfile?: ConnectionAcceptCommandPayload["capabilityProfile"];
+  capabilities?: ConnectionAcceptCommandPayload["capabilities"];
+  note?: ConnectionAcceptCommandPayload["note"];
+}
+
+export interface SendCommConnectionRejectOptions {
+  masterPassword?: string;
+  contactId: string;
+  senderPeerId?: string;
+  reason?: ConnectionRejectCommandPayload["reason"];
+  note?: ConnectionRejectCommandPayload["note"];
+}
+
+export interface SendCommConnectionCommandResult extends SendCommCommandResult {
+  contactId: string;
+  contactStatus: AgentContactStatus;
+  connectionEventId: string;
+  connectionEventType: AgentConnectionEventType;
+  connectionEventStatus: AgentConnectionEventStatus;
 }
 
 export interface ExportIdentityArtifactBundleOptions {
@@ -226,6 +281,121 @@ function defaultTemporaryDemoWalletAlias(config: AlphaOsConfig): string {
 function normalizeOptionalText(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed && trimmed.length > 0 ? trimmed : undefined;
+}
+
+function normalizeOptionalStringList(values: string[] | undefined): string[] | undefined {
+  if (!values || values.length === 0) {
+    return undefined;
+  }
+  const normalized = [...new Set(values.map((value) => value.trim()).filter(Boolean))];
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function resolveContactById(store: StateStore, contactId: string): AgentContact {
+  const contact = store.getAgentContact(contactId);
+  if (!contact) {
+    throw new Error(`contact not found: ${contactId}`);
+  }
+  return contact;
+}
+
+function resolveActiveContactEndpoint(store: StateStore, contactId: string): AgentTransportEndpoint {
+  const endpoint = store.listAgentTransportEndpoints(1, {
+    contactId,
+    endpointStatus: "active",
+  })[0];
+  if (!endpoint) {
+    throw new Error(`active transport endpoint not found for contact: ${contactId}`);
+  }
+  return endpoint;
+}
+
+function resolveOutboundPeerId(contact: AgentContact): string {
+  return contact.legacyPeerId ?? `contact:${contact.contactId}`;
+}
+
+function resolveOutboundContactTarget(store: StateStore, contactId: string): ResolvedOutboundContactTarget {
+  const contact = resolveContactById(store, contactId);
+  const endpoint = resolveActiveContactEndpoint(store, contact.contactId);
+  if (endpoint.identityWallet !== contact.identityWallet) {
+    throw new Error(
+      `contact endpoint identity mismatch for ${contact.contactId}: expected ${contact.identityWallet}, got ${endpoint.identityWallet}`,
+    );
+  }
+  return {
+    contact,
+    endpoint,
+    peerId: resolveOutboundPeerId(contact),
+  };
+}
+
+function assertContactStatus(
+  contact: AgentContact,
+  allowedStatuses: AgentContactStatus[],
+  actionLabel: string,
+): void {
+  if (allowedStatuses.includes(contact.status)) {
+    return;
+  }
+  throw new Error(
+    `cannot ${actionLabel} for contact ${contact.contactId}: expected status ${allowedStatuses.join(
+      " or ",
+    )}, received ${contact.status}`,
+  );
+}
+
+function updateContactStatus(
+  store: StateStore,
+  contact: AgentContact,
+  patch: {
+    status: AgentContactStatus;
+    capabilityProfile?: string;
+    capabilities?: string[];
+  },
+): AgentContact {
+  return store.upsertAgentContact({
+    contactId: contact.contactId,
+    identityWallet: contact.identityWallet,
+    legacyPeerId: contact.legacyPeerId,
+    status: patch.status,
+    capabilityProfile: patch.capabilityProfile,
+    capabilities: patch.capabilities,
+  });
+}
+
+function findOutboundMessageId(
+  store: StateStore,
+  peerId: string,
+  nonce: string,
+): string | undefined {
+  return store.findAgentMessage(peerId, "outbound", nonce)?.id;
+}
+
+function upsertOutboundConnectionEvent(
+  store: StateStore,
+  input: {
+    contact: AgentContact;
+    eventType: AgentConnectionEventType;
+    eventStatus: AgentConnectionEventStatus;
+    messageId?: string;
+    txHash?: string;
+    reason?: string;
+    occurredAt: string;
+    metadata?: Record<string, unknown>;
+  },
+): AgentConnectionEvent {
+  return store.upsertAgentConnectionEvent({
+    contactId: input.contact.contactId,
+    identityWallet: input.contact.identityWallet,
+    direction: "outbound",
+    eventType: input.eventType,
+    eventStatus: input.eventStatus,
+    messageId: input.messageId,
+    txHash: input.txHash,
+    reason: input.reason,
+    occurredAt: input.occurredAt,
+    metadata: input.metadata,
+  });
 }
 
 function classifyIdentityArtifactFailure(reason: string): IdentityArtifactFailureCode {
@@ -604,24 +774,28 @@ export async function importIdentityArtifactBundleFromJson(
 
 export type IdentityArtifactFailureCode = (typeof identityArtifactFailureCodes)[number];
 
-export async function sendCommCommand(
+async function sendCommCommandToRecipient(
   deps: AgentCommEntrypointDependencies,
-  options: SendCommCommandOptions,
+  options: {
+    masterPassword?: string;
+    senderPeerId?: string;
+    recipient: ResolvedCommRecipient;
+    command: AgentCommand;
+  },
 ): Promise<SendCommCommandResult> {
   const command = agentCommandSchema.parse(options.command);
   const masterPassword = getRequiredMasterPassword(options.masterPassword);
   const local = resolveLocalWallet(deps, masterPassword, options.senderPeerId);
-  const peer = getTrustedPeer(deps.store, options.peerId);
   const senderPeerId = resolveSenderPeerId(deps.config, options.senderPeerId);
   const nonce = crypto.randomUUID();
   const timestamp = new Date().toISOString();
-  const sharedKey = deriveSharedKey(local.wallet.privateKey, peer.pubkey);
+  const sharedKey = deriveSharedKey(local.wallet.privateKey, options.recipient.pubkey);
   const ciphertext = encrypt(JSON.stringify(command), sharedKey);
   const calldata = encodeEnvelope({
     version: AGENT_COMM_ENVELOPE_VERSION,
     senderPeerId,
     senderPubkey: local.identity.pubkey,
-    recipient: peer.walletAddress,
+    recipient: options.recipient.walletAddress,
     nonce,
     timestamp,
     command: {
@@ -638,22 +812,39 @@ export async function sendCommCommand(
       walletAlias: deps.config.commWalletAlias,
       store: deps.store,
       outboundMessage: {
-        peerId: peer.peerId,
+        peerId: options.recipient.peerId,
       },
     },
     local.wallet,
-    peer.walletAddress,
+    options.recipient.walletAddress,
     calldata,
   );
 
   return {
     ...local.identity,
     ...result,
-    peerId: peer.peerId,
-    recipient: peer.walletAddress,
+    peerId: options.recipient.peerId,
+    recipient: options.recipient.walletAddress,
     senderPeerId,
     commandType: command.type,
   };
+}
+
+export async function sendCommCommand(
+  deps: AgentCommEntrypointDependencies,
+  options: SendCommCommandOptions,
+): Promise<SendCommCommandResult> {
+  const peer = getTrustedPeer(deps.store, options.peerId);
+  return sendCommCommandToRecipient(deps, {
+    masterPassword: options.masterPassword,
+    senderPeerId: options.senderPeerId,
+    recipient: {
+      peerId: peer.peerId,
+      walletAddress: peer.walletAddress,
+      pubkey: peer.pubkey,
+    },
+    command: options.command,
+  });
 }
 
 export async function sendCommPing(
@@ -708,4 +899,179 @@ export async function sendCommStartDiscovery(
       },
     },
   });
+}
+
+export async function sendCommConnectionInvite(
+  deps: AgentCommEntrypointDependencies,
+  options: SendCommConnectionInviteOptions,
+): Promise<SendCommConnectionCommandResult> {
+  const target = resolveOutboundContactTarget(deps.store, options.contactId);
+  if (target.contact.status === "blocked" || target.contact.status === "revoked") {
+    throw new Error(
+      `cannot send connection_invite to ${target.contact.status} contact: ${target.contact.contactId}`,
+    );
+  }
+
+  const requestedProfile = normalizeOptionalText(options.requestedProfile);
+  const requestedCapabilities = normalizeOptionalStringList(options.requestedCapabilities);
+  const note = normalizeOptionalText(options.note);
+
+  const sent = await sendCommCommandToRecipient(deps, {
+    masterPassword: options.masterPassword,
+    senderPeerId: options.senderPeerId,
+    recipient: {
+      peerId: target.peerId,
+      walletAddress: target.endpoint.receiveAddress,
+      pubkey: target.endpoint.pubkey,
+    },
+    command: {
+      type: "connection_invite",
+      payload: {
+        ...(requestedProfile ? { requestedProfile } : {}),
+        ...(requestedCapabilities ? { requestedCapabilities } : {}),
+        ...(note ? { note } : {}),
+      },
+    },
+  });
+
+  const updatedContact = updateContactStatus(deps.store, target.contact, {
+    status: "pending_outbound",
+  });
+  const event = upsertOutboundConnectionEvent(deps.store, {
+    contact: updatedContact,
+    eventType: "connection_invite",
+    eventStatus: "pending",
+    messageId: findOutboundMessageId(deps.store, sent.peerId, sent.nonce),
+    txHash: sent.txHash,
+    reason: note,
+    occurredAt: sent.sentAt,
+    metadata: {
+      requestedProfile,
+      requestedCapabilities,
+      senderPeerId: sent.senderPeerId,
+    },
+  });
+
+  return {
+    ...sent,
+    contactId: updatedContact.contactId,
+    contactStatus: updatedContact.status,
+    connectionEventId: event.id,
+    connectionEventType: event.eventType,
+    connectionEventStatus: event.eventStatus,
+  };
+}
+
+export async function sendCommConnectionAccept(
+  deps: AgentCommEntrypointDependencies,
+  options: SendCommConnectionAcceptOptions,
+): Promise<SendCommConnectionCommandResult> {
+  const target = resolveOutboundContactTarget(deps.store, options.contactId);
+  assertContactStatus(target.contact, ["pending_inbound"], "send connection_accept");
+
+  const capabilityProfile = normalizeOptionalText(options.capabilityProfile);
+  const capabilities = normalizeOptionalStringList(options.capabilities);
+  const note = normalizeOptionalText(options.note);
+
+  const sent = await sendCommCommandToRecipient(deps, {
+    masterPassword: options.masterPassword,
+    senderPeerId: options.senderPeerId,
+    recipient: {
+      peerId: target.peerId,
+      walletAddress: target.endpoint.receiveAddress,
+      pubkey: target.endpoint.pubkey,
+    },
+    command: {
+      type: "connection_accept",
+      payload: {
+        ...(capabilityProfile ? { capabilityProfile } : {}),
+        ...(capabilities ? { capabilities } : {}),
+        ...(note ? { note } : {}),
+      },
+    },
+  });
+
+  const updatedContact = updateContactStatus(deps.store, target.contact, {
+    status: "trusted",
+    capabilityProfile,
+    capabilities,
+  });
+  const event = upsertOutboundConnectionEvent(deps.store, {
+    contact: updatedContact,
+    eventType: "connection_accept",
+    eventStatus: "applied",
+    messageId: findOutboundMessageId(deps.store, sent.peerId, sent.nonce),
+    txHash: sent.txHash,
+    reason: note,
+    occurredAt: sent.sentAt,
+    metadata: {
+      capabilityProfile,
+      capabilities,
+      senderPeerId: sent.senderPeerId,
+    },
+  });
+
+  return {
+    ...sent,
+    contactId: updatedContact.contactId,
+    contactStatus: updatedContact.status,
+    connectionEventId: event.id,
+    connectionEventType: event.eventType,
+    connectionEventStatus: event.eventStatus,
+  };
+}
+
+export async function sendCommConnectionReject(
+  deps: AgentCommEntrypointDependencies,
+  options: SendCommConnectionRejectOptions,
+): Promise<SendCommConnectionCommandResult> {
+  const target = resolveOutboundContactTarget(deps.store, options.contactId);
+  assertContactStatus(target.contact, ["pending_inbound"], "send connection_reject");
+
+  const reason = normalizeOptionalText(options.reason);
+  const note = normalizeOptionalText(options.note);
+
+  const sent = await sendCommCommandToRecipient(deps, {
+    masterPassword: options.masterPassword,
+    senderPeerId: options.senderPeerId,
+    recipient: {
+      peerId: target.peerId,
+      walletAddress: target.endpoint.receiveAddress,
+      pubkey: target.endpoint.pubkey,
+    },
+    command: {
+      type: "connection_reject",
+      payload: {
+        ...(reason ? { reason } : {}),
+        ...(note ? { note } : {}),
+      },
+    },
+  });
+
+  const updatedContact = updateContactStatus(deps.store, target.contact, {
+    status: "imported",
+  });
+  const event = upsertOutboundConnectionEvent(deps.store, {
+    contact: updatedContact,
+    eventType: "connection_reject",
+    eventStatus: "applied",
+    messageId: findOutboundMessageId(deps.store, sent.peerId, sent.nonce),
+    txHash: sent.txHash,
+    reason: reason ?? note,
+    occurredAt: sent.sentAt,
+    metadata: {
+      reason,
+      note,
+      senderPeerId: sent.senderPeerId,
+    },
+  });
+
+  return {
+    ...sent,
+    contactId: updatedContact.contactId,
+    contactStatus: updatedContact.status,
+    connectionEventId: event.id,
+    connectionEventType: event.eventType,
+    connectionEventStatus: event.eventStatus,
+  };
 }
