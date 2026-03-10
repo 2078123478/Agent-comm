@@ -34,7 +34,6 @@ export interface TransactionEvent {
 class ChainIdMismatchError extends Error {}
 type MinedTransaction = Transaction & { to: Address; blockNumber: bigint };
 type BlockReceiptSupport = "unknown" | "supported" | "unsupported";
-const CATCH_UP_BACKLOG_THRESHOLD = 1n;
 
 function normalizeAddress(value: string, label: string): Address {
   try {
@@ -165,7 +164,7 @@ export function startListener(
 
   const targetAddress = normalizeAddress(options.address, "listener address");
   const publicClient = createPublicClient({
-    transport: http(options.rpcUrl),
+    transport: http(options.rpcUrl, { batch: true }),
   });
   const pollIntervalMs = Math.max(100, Math.floor(options.pollIntervalMs));
 
@@ -173,6 +172,7 @@ export function startListener(
   let timer: NodeJS.Timeout | undefined;
   let isPolling = false;
   let blockReceiptSupport: BlockReceiptSupport = "unknown";
+  let chainIdVerified = false;
 
   const reportError = (error: unknown): void => {
     const normalized =
@@ -276,11 +276,14 @@ export function startListener(
     isPolling = true;
 
     try {
-      const rpcChainId = await publicClient.getChainId();
-      if (rpcChainId !== options.chainId) {
-        throw new ChainIdMismatchError(
-          `RPC chainId mismatch: expected ${options.chainId}, received ${rpcChainId}`,
-        );
+      if (!chainIdVerified) {
+        const rpcChainId = await publicClient.getChainId();
+        if (rpcChainId !== options.chainId) {
+          throw new ChainIdMismatchError(
+            `RPC chainId mismatch: expected ${options.chainId}, received ${rpcChainId}`,
+          );
+        }
+        chainIdVerified = true;
       }
 
       const latestBlockNumber = await publicClient.getBlockNumber();
@@ -294,19 +297,13 @@ export function startListener(
       if (nextBlockNumber > latestBlockNumber) {
         return;
       }
-      const shouldUseReceiptCatchUp =
-        latestBlockNumber - nextBlockNumber >= CATCH_UP_BACKLOG_THRESHOLD;
 
       for (
         let blockNumber = nextBlockNumber;
         blockNumber <= latestBlockNumber && !stopped;
         blockNumber += 1n
       ) {
-        let handledByReceipts = false;
-        if (shouldUseReceiptCatchUp) {
-          handledByReceipts = await processBlockWithReceipts(blockNumber);
-        }
-
+        const handledByReceipts = await processBlockWithReceipts(blockNumber);
         if (!handledByReceipts) {
           await processBlockWithFullScan(blockNumber);
         }
