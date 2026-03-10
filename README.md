@@ -131,6 +131,7 @@ VAULT_MASTER_PASSWORD=pass123 npm run dev -- vault:get trader-key
 **Quick Start:**
 - 🚀 **Production Deployment Guide**: `docs/AGENT_COMM_PRODUCTION_DEPLOYMENT.md` — Battle-tested 6-step deployment
 - 💡 **Revolutionary Design**: `docs/AGENT_COMM_REVOLUTIONARY_DESIGN.md` — Why this protocol matters
+- 🔔 **Webhook Notification (Optional)**: `docs/AGENT_COMM_PRODUCTION_DEPLOYMENT.md#webhook-notification-optional` — Wake OpenClaw or any webhook-compatible orchestrator on inbound messages
 
 **Protocol Documentation:**
 - v2 协议草案（架构评审版）：`docs/AGENT_COMM_PROTOCOL_V2_DRAFT.md`，包含签名标准推荐、陌生人建联/冷启动消息策略、direct-tx 隐私边界
@@ -153,6 +154,9 @@ COMM_RPC_URL=https://your-rpc
 COMM_CHAIN_ID=196
 COMM_LISTENER_MODE=poll
 COMM_WALLET_ALIAS=agent-comm
+# Optional: webhook notification on inbound messages
+# COMM_WEBHOOK_URL=http://127.0.0.1:18789/hooks/wake
+# COMM_WEBHOOK_TOKEN=your-webhook-secret
 ```
 2. Initialize or restore the comm wallet directly:
 ```bash

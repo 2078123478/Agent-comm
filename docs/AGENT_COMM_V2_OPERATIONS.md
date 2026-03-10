@@ -238,6 +238,46 @@ Recommended recovery posture:
 | direct-tx send fails with insufficient balance | ACW has no gas token | fund the active comm wallet or restore a funded key |
 | old receiver still rejects business commands | remote side is relying on legacy trusted-peer checks | keep the compatible manual peer record on the true v1 side until it upgrades |
 
+## Environment Variables Reference
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `COMM_ENABLED` | bool | `false` | Enables Agent-Comm runtime surfaces and listeners. |
+| `COMM_CHAIN_ID` | int | `196` | Target EVM chain ID for message submission/listening. |
+| `COMM_RPC_URL` | string | required when enabled | RPC endpoint used for chain reads/writes. |
+| `COMM_LISTENER_MODE` | `poll` \| `disabled` | `disabled` | Listener mode for inbound message processing. |
+| `COMM_POLL_INTERVAL_MS` | int | `5000` | Poll interval in milliseconds when listener mode is `poll`. |
+| `COMM_WALLET_ALIAS` | string | `"agent-comm"` | Vault alias for the active comm wallet. |
+| `COMM_SUBMIT_MODE` | `direct` \| `relay` | `direct` | Outbound submission path. |
+| `COMM_RELAY_URL` | string | optional | Relay endpoint when submit mode is `relay`. |
+| `COMM_RELAY_TIMEOUT_MS` | int | `10000` | Timeout for relay submission HTTP calls. |
+| `COMM_PAYMASTER_URL` | string | optional | Paymaster endpoint for sponsored transactions. |
+| `COMM_WEBHOOK_URL` | string | optional | HTTP endpoint to `POST` when an inbound message is processed. |
+| `COMM_WEBHOOK_TOKEN` | string | optional | Bearer token used for webhook authorization. |
+| `COMM_AUTO_ACCEPT_INVITES` | bool | `false` | Auto-accepts valid inbound connection invites. |
+| `COMM_ARTIFACT_EXPIRY_WARNING_DAYS` | int | `7` | Warning threshold (days) before artifact expiry. |
+| `AGENT_COMM_PRIVATE_KEY` | hex string | optional | Imports/restores an existing comm wallet private key. |
+| `VAULT_MASTER_PASSWORD` | string | required for wallet operations | Vault unlock secret for wallet initialization, rotation, and key access. |
+
+## Webhook Integration
+
+Agent-Comm supports an optional fire-and-forget webhook POST for each inbound message after local processing. This enables immediate wake-up signals to external orchestrators without changing on-chain message flow.
+
+Payload format:
+
+```json
+{"text":"[agent-comm] Inbound <type> from <address> (tx: <hash>...)","mode":"now"}
+```
+
+For OpenClaw integration details and end-to-end examples, see `docs/AGENT_COMM_PRODUCTION_DEPLOYMENT.md` (`Webhook Notification (Optional)`).
+
+## Performance Notes
+
+- Batch RPC transport is enabled via viem HTTP batching (zero extra config).
+- Chain ID verification is cached and checked once per runtime path instead of per poll cycle.
+- Unified receipts mode uses `eth_getBlockReceipts` for all blocks, with automatic fallback to full-scan logic when unavailable.
+- Polling tuning: keep `COMM_POLL_INTERVAL_MS=5000` as default for balanced latency/load; reduce to `1000-3000` for faster reaction if your RPC can sustain higher request rates.
+
 ## Related files
 - Demo walkthrough: `scripts/agent-comm-demo.sh`
 - Demo notes: `scripts/agent-comm-demo.md`

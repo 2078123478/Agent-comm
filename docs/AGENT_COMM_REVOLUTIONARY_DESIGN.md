@@ -253,7 +253,7 @@ Who talks to whom is visible on-chain.
 
 Block polling is slow when catching up.
 
-**Mitigation**: Implement `eth_getLogs` batch fetching (10x faster).
+**Mitigation**: Mitigated: batch RPC transport, cached chainId, unified receipts filtering. Poll mode handles real-time monitoring with minimal overhead (~1 HTTP request per poll cycle).
 
 ## Roadmap
 
@@ -264,10 +264,11 @@ Block polling is slow when catching up.
 - E2E encryption
 
 ### Phase 2: Production Hardening (🚧 In Progress)
-- getLogs optimization
-- Relayer support
-- Multi-chain deployment
-- Monitoring/alerting
+- getLogs optimization (replaced by unified receipts + batch RPC transport) ✅
+- Webhook integration ✅
+- Relayer support (in progress)
+- Multi-chain deployment (in progress)
+- Monitoring/alerting (in progress)
 
 ### Phase 3: Advanced Features (📋 Planned)
 - State channels
@@ -281,6 +282,19 @@ Block polling is slow when catching up.
 2. Deploy: Follow the 6-step guide
 3. Extend: Add your own commands
 4. Scale: Optimize for your use case
+
+## Integrations
+
+### OpenClaw Webhook Integration
+
+Agent-Comm can POST inbound-message notifications to OpenClaw's `/hooks/wake` endpoint so orchestration reacts immediately to new on-chain messages.
+The integration is optional and configured with `COMM_WEBHOOK_URL` and (optionally) `COMM_WEBHOOK_TOKEN`.
+This keeps protocol transport fully on-chain while allowing low-latency off-chain wake-up behavior.
+
+### Extensible Webhook Targets
+
+The same webhook contract can be used with any webhook-compatible system (custom schedulers, alerting gateways, workflow engines, bots).
+No protocol changes are required; only endpoint and auth configuration differ.
 
 ## Philosophy
 

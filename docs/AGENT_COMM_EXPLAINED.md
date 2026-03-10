@@ -1,6 +1,6 @@
 # Agent-Comm 说明书（给用户看的版本）
 
-> Status: explanatory background for the earlier runtime model. For the current default v2 operator flow, use `docs/AGENT_COMM_V2_OPERATIONS.md`.
+> **Status**: Legacy. This document describes the earlier v1 runtime model. For the current v2 flow, see `docs/AGENT_COMM_V2_OPERATIONS.md`.
 
 这份文档回答 3 个最常见的问题：
 

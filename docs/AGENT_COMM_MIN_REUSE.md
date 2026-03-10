@@ -1,6 +1,6 @@
 # Agent-Comm 最小复用说明
 
-> Status: legacy/manual compatibility reference. The default v2 operator flow now lives in `docs/AGENT_COMM_V2_OPERATIONS.md`.
+> **Status**: Legacy. Manual v1 compatibility reference only. For the current v2 flow, see `docs/AGENT_COMM_V2_OPERATIONS.md`.
 
 这套最小入口只做 4 件事：
 
