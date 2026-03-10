@@ -2,6 +2,50 @@
 
 AlphaOS is implemented as a reusable skill runtime, not a loose set of services.
 
+## Product Highlights
+
+Beyond the core arbitrage engine and Agent-Comm protocol, AlphaOS ships a set of product-level touches designed for real-world operator experience and organic distribution.
+
+**Shareable Identity (Agent-Comm)**
+
+- Export a self-contained HTML contact card with embedded QR code — works offline, hostable anywhere, no external dependencies.
+- Consent-gated connections: importing a card does not auto-trust. The peer requests a connection; the owner approves or rejects. Safe to share publicly.
+
+![Agent-Comm HTML contact card](docs/assets/agent-comm-card-preview.png)
+
+```bash
+# Generate a shareable HTML card
+VAULT_MASTER_PASSWORD=pass123 npm run dev -- agent-comm:card:export --html --output ./my-card.html
+```
+
+**Growth & Distribution Engine**
+
+- `/api/v1/growth/moments` — auto-generated shareable content: daily summaries, best trades, win streaks, risk events. Ready for social distribution.
+- `/api/v1/growth/share/latest` — one-call battle report export for community sharing.
+- `/api/v1/stream/metrics` — SSE real-time stream of opportunities, trades, PnL, and mode changes. Plug into any dashboard or terminal UI.
+
+**Observability & Reproducibility**
+
+- `/api/v1/backtest/snapshot` — export historical data as JSON or CSV for offline analysis.
+- `/api/v1/replay/sandbox` — replay past trades under different parameters to validate strategy changes.
+- `/api/v1/integration/onchainos/probe` — one-click health check of the full OnchainOS v6 execution path (quote → swap → simulate → broadcast). Reports readiness level: `ready` / `degraded` / `unavailable`.
+
+**Live Demo Page**
+
+- `GET /demo` — a built-in browser page that streams live metrics, growth moments, and OnchainOS probe status in real time. No frontend build step required.
+
+**Webhook Bridge (Optional)**
+
+- Fire-and-forget notification on every successfully processed inbound Agent-Comm message. Wake OpenClaw, trigger a workflow, or feed any webhook-compatible system.
+
+**One-Click Demo Scripts**
+
+```bash
+npm run demo:run            # Full arbitrage cycle demo → demo-output/
+npm run demo:discovery      # Discovery engine demo → demo-output/
+npm run demo:smoke:live     # Live OnchainOS integration smoke test
+```
+
 ## Layout
 - `skills/alphaos/SKILL.md`: reusable skill contract and workflow
 - `src/skills/alphaos/`: runtime implementation for this skill
@@ -179,9 +223,7 @@ VAULT_MASTER_PASSWORD=pass123 npm run dev -- agent-comm:wallet:init-demo
 VAULT_MASTER_PASSWORD=pass123 npm run dev -- agent-comm:card:export --output ./my-card.json
 VAULT_MASTER_PASSWORD=pass123 npm run dev -- agent-comm:card:export --html --output ./my-card.html
 ```
-Preview (HTML card):
-
-![Agent-Comm shareable contact card preview](docs/assets/agent-comm-card-preview.png)
+See [Product Highlights](#product-highlights) above for a preview of the HTML card.
 
 See a non-cryptographic example fixture (for docs/tests only):
 - `docs/examples/agent-comm/sample-agent.card.html`
